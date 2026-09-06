@@ -1,9 +1,12 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { Progress } from './ui/progress';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Input } from './ui/input';
 import { Button } from './ui/button';
 import { Label } from './ui/label';
+import { Switch } from './ui/switch';
 import { Eye, EyeOff, Lock, Unlock } from 'lucide-react';
 import { ModelManager } from './WhisperModelManager';
 import { ParakeetModelManager } from './ParakeetModelManager';
@@ -21,17 +24,106 @@ export interface TranscriptSettingsProps {
     onModelSelect?: () => void;
 }
 
+// Mirrors Rust's DiarizationModelStatus (diarization/model.rs) as serialized by serde's
+// default externally-tagged enum representation -- same convention already used
+// elsewhere in this codebase for Whisper/Parakeet's ModelStatus (see
+// transcription-model-readiness.ts's hasDownloadingModel).
+type DiarizationModelStatus =
+    | 'Available'
+    | 'Missing'
+    | { Downloading: { progress: number } }
+    | { Corrupted: { file: string } }
+    | { Error: string };
+
 export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelConfig, onModelSelect }: TranscriptSettingsProps) {
     const [apiKey, setApiKey] = useState<string | null>(transcriptModelConfig.apiKey || null);
     const [showApiKey, setShowApiKey] = useState<boolean>(false);
     const [isApiKeyLocked, setIsApiKeyLocked] = useState<boolean>(true);
     const [isLockButtonVibrating, setIsLockButtonVibrating] = useState<boolean>(false);
     const [uiProvider, setUiProvider] = useState<TranscriptModelProps['provider']>(transcriptModelConfig.provider);
+    // Diarization toggle (ADR-0010): global opt-in, default off, separate from the
+    // transcript provider/model config above -- see api_get/save_diarization_enabled.
+    const [diarizationEnabled, setDiarizationEnabled] = useState<boolean>(false);
+    const [isDiarizationToggleBusy, setIsDiarizationToggleBusy] = useState<boolean>(false);
+    const [diarizationModelStatus, setDiarizationModelStatus] = useState<DiarizationModelStatus | null>(null);
+    const [diarizationDownloadPercent, setDiarizationDownloadPercent] = useState<number>(0);
+    const [isDiarizationDownloading, setIsDiarizationDownloading] = useState<boolean>(false);
+    const [diarizationDownloadError, setDiarizationDownloadError] = useState<string | null>(null);
+
+    const refreshDiarizationModelStatus = async () => {
+        try {
+            const status = await invoke<DiarizationModelStatus>('diarization_get_status');
+            setDiarizationModelStatus(status);
+        } catch (err) {
+            console.error('Error fetching diarization model status:', err);
+        }
+    };
+
+    // Check model status once diarization is toggled on (no need while it's off)
+    useEffect(() => {
+        if (diarizationEnabled) {
+            refreshDiarizationModelStatus();
+        }
+    }, [diarizationEnabled]);
+
+    // Listen for download progress/completion/error, same event-naming convention as
+    // parakeet-model-download-*/builtin-ai-download-*
+    useEffect(() => {
+        const unlistenPromises = [
+            listen<{ file: string; percent: number }>('diarization-model-download-progress', (event) => {
+                setDiarizationDownloadPercent(event.payload.percent);
+            }),
+            listen('diarization-model-download-complete', () => {
+                setIsDiarizationDownloading(false);
+                setDiarizationDownloadError(null);
+                refreshDiarizationModelStatus();
+            }),
+            listen<string>('diarization-model-download-error', (event) => {
+                setIsDiarizationDownloading(false);
+                setDiarizationDownloadError(event.payload);
+            }),
+        ];
+        return () => {
+            unlistenPromises.forEach((p) => p.then((unlisten) => unlisten()));
+        };
+    }, []);
+
+    const handleDownloadDiarizationModels = async () => {
+        setIsDiarizationDownloading(true);
+        setDiarizationDownloadPercent(0);
+        setDiarizationDownloadError(null);
+        try {
+            await invoke('diarization_download_models');
+        } catch (err) {
+            setIsDiarizationDownloading(false);
+            setDiarizationDownloadError(String(err));
+        }
+    };
 
     // Sync uiProvider when backend config changes (e.g., after model selection or initial load)
     useEffect(() => {
         setUiProvider(transcriptModelConfig.provider);
     }, [transcriptModelConfig.provider]);
+
+    useEffect(() => {
+        invoke<boolean>('api_get_diarization_enabled')
+            .then(setDiarizationEnabled)
+            .catch((err) => console.error('Error fetching diarization_enabled:', err));
+    }, []);
+
+    const handleDiarizationToggle = async (checked: boolean) => {
+        setIsDiarizationToggleBusy(true);
+        const previous = diarizationEnabled;
+        setDiarizationEnabled(checked); // optimistic update
+        try {
+            await invoke('api_save_diarization_enabled', { enabled: checked });
+        } catch (err) {
+            console.error('Error saving diarization_enabled:', err);
+            setDiarizationEnabled(previous); // revert on failure
+        } finally {
+            setIsDiarizationToggleBusy(false);
+        }
+    };
 
     useEffect(() => {
         if (transcriptModelConfig.provider === 'localWhisper' || transcriptModelConfig.provider === 'parakeet') {
@@ -219,6 +311,58 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                             </div>
                         </div>
                     )}
+
+                    <div className="pt-2 border-t border-gray-100">
+                        <div className="flex items-center justify-between mt-4">
+                            <div className="pr-4">
+                                <Label className="block text-sm font-medium text-gray-700">
+                                    Speaker diarization
+                                </Label>
+                                <p className="text-xs text-gray-500 mt-0.5">
+                                    Label who is speaking in the transcript. Runs entirely locally, CPU-only.
+                                    Adds a short "diarizing" step when a recording stops. Requires downloading
+                                    ~33MB of additional models on first use.
+                                </p>
+                            </div>
+                            <Switch
+                                checked={diarizationEnabled}
+                                disabled={isDiarizationToggleBusy}
+                                onCheckedChange={handleDiarizationToggle}
+                            />
+                        </div>
+
+                        {diarizationEnabled && (
+                            <div className="mt-3 mx-1 p-3 rounded-md border border-gray-200 bg-gray-50">
+                                {isDiarizationDownloading ? (
+                                    <div>
+                                        <p className="text-xs text-gray-600 mb-1">
+                                            Downloading diarization models... {diarizationDownloadPercent}%
+                                        </p>
+                                        <Progress value={diarizationDownloadPercent} />
+                                    </div>
+                                ) : diarizationModelStatus === 'Available' ? (
+                                    <p className="text-xs text-emerald-700">✓ Diarization models ready</p>
+                                ) : (
+                                    <div className="flex items-center justify-between gap-3">
+                                        <p className="text-xs text-gray-600">
+                                            {diarizationDownloadError
+                                                ? `Download failed: ${diarizationDownloadError}`
+                                                : 'Diarization models not downloaded yet. Recording will be blocked while diarization is on until this completes.'}
+                                        </p>
+                                        <Button
+                                            type="button"
+                                            variant="outline"
+                                            size="sm"
+                                            onClick={handleDownloadDiarizationModels}
+                                            className="shrink-0"
+                                        >
+                                            {diarizationDownloadError ? 'Retry' : 'Download'}
+                                        </Button>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
                 </div>
             </div>
         </div >

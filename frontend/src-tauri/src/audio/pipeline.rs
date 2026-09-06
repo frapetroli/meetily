@@ -694,6 +694,11 @@ pub struct AudioPipeline {
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    // Diarization sender for pre-mixed audio (third consumer, active only when
+    // diarization_enabled -- ADR-0009/ADR-0010). Same tap as recording_sender_for_mixed,
+    // not the VAD-segmented one, so the diarization segmentation model sees continuous
+    // audio instead of speech-only fragments.
+    diarization_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
 }
 
 impl AudioPipeline {
@@ -760,6 +765,7 @@ impl AudioPipeline {
             ring_buffer,
             mixer,
             recording_sender_for_mixed: None,  // Will be set by manager
+            diarization_sender_for_mixed: None,  // Will be set by manager, only if diarization is enabled
         }
     }
 
@@ -876,6 +882,19 @@ impl AudioPipeline {
                                 };
                                 let _ = sender.send(recording_chunk);
                             }
+
+                            // STEP 5: Send the same mixed audio to diarization, if enabled
+                            // (ADR-0009: same tap as RecordingSaver, not the VAD-segmented one)
+                            if let Some(ref sender) = self.diarization_sender_for_mixed {
+                                let diarization_chunk = AudioChunk {
+                                    data: mixed_with_gain,
+                                    sample_rate: self.sample_rate,
+                                    timestamp: chunk.timestamp,
+                                    chunk_id: self.chunk_id_counter,
+                                    device_type: DeviceType::Microphone,  // Mixed audio
+                                };
+                                let _ = sender.send(diarization_chunk);
+                            }
                         }
                     }
                 }
@@ -954,7 +973,11 @@ impl AudioPipelineManager {
         }
     }
 
-    /// Start the audio pipeline with device information for adaptive buffering
+    /// Start the audio pipeline with device information for adaptive buffering.
+    ///
+    /// `diarization_sender` is `Some` only when `transcript_settings.diarization_enabled`
+    /// is on (ADR-0010) -- when `None`, no diarization work happens at all, same as
+    /// today (zero overhead when the toggle is off).
     pub fn start(
         &mut self,
         state: Arc<RecordingState>,
@@ -962,6 +985,7 @@ impl AudioPipelineManager {
         target_chunk_duration_ms: u32,
         sample_rate: u32,
         recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+        diarization_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
         mic_device_name: String,
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
@@ -994,6 +1018,8 @@ impl AudioPipelineManager {
         // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
         // This ensures both mic AND system audio are captured in recordings
         pipeline.recording_sender_for_mixed = recording_sender;
+        // Same pre-mixed tap for diarization, only wired up if the toggle is on.
+        pipeline.diarization_sender_for_mixed = diarization_sender;
 
         let handle = tokio::spawn(async move {
             pipeline.run().await

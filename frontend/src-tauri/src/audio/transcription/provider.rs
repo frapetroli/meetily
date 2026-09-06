@@ -4,6 +4,7 @@
 // transcription engines (Whisper, Parakeet, future providers).
 
 use async_trait::async_trait;
+use crate::diarization::WordTiming;
 
 // ============================================================================
 // TRANSCRIPTION PROVIDER TRAIT & ERROR TYPES
@@ -43,6 +44,10 @@ pub struct TranscriptResult {
     pub text: String,
     pub confidence: Option<f32>, // None if provider doesn't support confidence scores
     pub is_partial: bool,
+    /// Per-word timestamps, populated only when `transcribe()` was called with
+    /// `include_word_timestamps: true` (diarization toggle on -- ADR-0013). `None`
+    /// otherwise, including for providers that don't support word timestamps at all.
+    pub word_timestamps: Option<Vec<WordTiming>>,
 }
 
 /// Trait for transcription providers (Whisper, Parakeet, future providers)
@@ -53,6 +58,10 @@ pub trait TranscriptionProvider: Send + Sync {
     /// # Arguments
     /// * `audio` - Audio samples (16kHz mono, f32 format)
     /// * `language` - Optional language hint (e.g., "en", "es", "fr")
+    /// * `include_word_timestamps` - gates per-word timestamp extraction (ADR-0013);
+    ///   `false` on the default (diarization-off) hot path, no behavior/cost change from
+    ///   before this parameter existed. Providers that can't support this simply ignore
+    ///   it and always return `word_timestamps: None`.
     ///
     /// # Returns
     /// * `TranscriptResult` with text, optional confidence, and partial flag
@@ -60,6 +69,7 @@ pub trait TranscriptionProvider: Send + Sync {
         &self,
         audio: Vec<f32>,
         language: Option<String>,
+        include_word_timestamps: bool,
     ) -> std::result::Result<TranscriptResult, TranscriptionError>;
 
     /// Check if a model is currently loaded

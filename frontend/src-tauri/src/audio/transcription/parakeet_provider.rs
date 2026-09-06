@@ -24,6 +24,7 @@ impl TranscriptionProvider for ParakeetProvider {
         &self,
         audio: Vec<f32>,
         language: Option<String>,
+        include_word_timestamps: bool,
     ) -> std::result::Result<TranscriptResult, TranscriptionError> {
         // Log language preference warning if set (Parakeet doesn't support it yet)
         if let Some(ref lang) = language {
@@ -33,11 +34,12 @@ impl TranscriptionProvider for ParakeetProvider {
             );
         }
 
-        match self.engine.transcribe_audio(audio).await {
-            Ok(text) => Ok(TranscriptResult {
+        match self.engine.transcribe_audio(audio, include_word_timestamps).await {
+            Ok((text, word_timestamps)) => Ok(TranscriptResult {
                 text: text.trim().to_string(),
                 confidence: None, // Parakeet doesn't provide confidence scores
                 is_partial: false, // Parakeet doesn't provide partial results
+                word_timestamps,
             }),
             Err(e) => Err(TranscriptionError::EngineFailed(e.to_string())),
         }

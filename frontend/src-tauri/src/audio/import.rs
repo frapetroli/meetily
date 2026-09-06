@@ -4,6 +4,7 @@ use crate::api::TranscriptSegment;
 use crate::audio::decoder::{decode_audio_file, decode_audio_file_with_progress};
 use crate::audio::vad::get_speech_chunks_with_progress;
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
+use crate::diarization::{assign_word_speakers, group_into_speaker_turns, DiarizationEngine, SpeakerSegment, WordTiming};
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
@@ -419,6 +420,26 @@ async fn run_import<R: Runtime>(
         audio_samples.len()
     );
 
+    // Diarization (ADR-0009/ADR-0013, roadmap 6g) -- same batch treatment as
+    // retranscription.rs: whole decoded file in one shot, on the same pre-VAD buffer,
+    // before it's moved into the VAD task below. See the equivalent block in
+    // retranscription.rs for the full rationale.
+    let diarization_paths = crate::diarization::model::resolve_paths_if_enabled(&app)
+        .await
+        .map_err(|e| anyhow!(e))?;
+    let diarization_enabled = diarization_paths.is_some();
+    let diarization_task = diarization_paths.map(|(segmentation_model_path, embedding_model_path)| {
+        let audio_for_diarization = audio_samples.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<SpeakerSegment>> {
+            let mut engine = DiarizationEngine::new(&segmentation_model_path, &embedding_model_path, 1)
+                .map_err(|e| anyhow!("Failed to initialize diarization engine: {}", e))?;
+            engine
+                .process_chunk(&audio_for_diarization, 0.0)
+                .map_err(|e| anyhow!("Diarization processing failed: {}", e))?;
+            Ok(engine.finalize())
+        })
+    });
+
     emit_progress(&app, "vad", 25, "Detecting speech segments...");
 
     // Check for cancellation
@@ -547,6 +568,9 @@ async fn run_import<R: Runtime>(
     // Process each speech segment
     let mut all_transcripts: Vec<(String, f64, f64)> = Vec::new();
     let mut total_confidence = 0.0f32;
+    // Per-word timestamps across all segments, offset to be absolute file-relative
+    // (seconds) -- only populated when diarization_enabled (ADR-0013).
+    let mut word_timestamps_accumulator: Vec<WordTiming> = Vec::new();
 
     for (i, segment) in processable_segments.iter().enumerate() {
         if IMPORT_CANCELLED.load(Ordering::SeqCst) {
@@ -578,20 +602,35 @@ async fn run_import<R: Runtime>(
             continue;
         }
 
-        // Transcribe
+        // Transcribe. `diarization_enabled` gates word-timestamp extraction (ADR-0013).
+        let segment_offset_secs = segment.start_timestamp_ms / 1000.0;
         let (text, conf) = if use_parakeet {
             let engine = parakeet_engine.as_ref().unwrap();
-            let text = engine
-                .transcribe_audio(segment.samples.clone())
+            let (text, word_timestamps) = engine
+                .transcribe_audio(segment.samples.clone(), diarization_enabled)
                 .await
                 .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
+            if let Some(words) = word_timestamps {
+                word_timestamps_accumulator.extend(words.into_iter().map(|w| WordTiming {
+                    word: w.word,
+                    start: w.start + segment_offset_secs,
+                    end: w.end + segment_offset_secs,
+                }));
+            }
             (text, 0.9f32)
         } else {
             let engine = whisper_engine.as_ref().unwrap();
-            let (text, conf, _) = engine
-                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
+            let (text, conf, _, word_timestamps) = engine
+                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone(), diarization_enabled)
                 .await
                 .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
+            if let Some(words) = word_timestamps {
+                word_timestamps_accumulator.extend(words.into_iter().map(|w| WordTiming {
+                    word: w.word,
+                    start: w.start + segment_offset_secs,
+                    end: w.end + segment_offset_secs,
+                }));
+            }
             (text, conf)
         };
 
@@ -627,10 +666,43 @@ async fn run_import<R: Runtime>(
         return Err(anyhow!("Import cancelled"));
     }
 
+    // Finalize diarization (if enabled) and merge with the accumulated word timestamps --
+    // see the equivalent block in retranscription.rs for the full rationale.
+    let diarized_turns = match diarization_task {
+        Some(task) => {
+            let speaker_segments = task
+                .await
+                .map_err(|e| anyhow!("Diarization task panicked: {}", e))??;
+            info!(
+                "Diarization produced {} speaker segments from {} transcribed words",
+                speaker_segments.len(),
+                word_timestamps_accumulator.len()
+            );
+            let words_with_speaker = assign_word_speakers(&word_timestamps_accumulator, &speaker_segments);
+            Some(group_into_speaker_turns(&words_with_speaker))
+        }
+        None => None,
+    };
+
     emit_progress(&app, "saving", 85, "Creating meeting...");
 
-    // Create transcript segments
-    let segments = create_transcript_segments(&all_transcripts);
+    // Create transcript segments: diarized turns (with speaker) replace the plain
+    // per-VAD-segment transcript when diarization produced any (ADR-0009).
+    let segments: Vec<TranscriptSegment> = match &diarized_turns {
+        Some(turns) if !turns.is_empty() => turns
+            .iter()
+            .map(|turn| TranscriptSegment {
+                id: format!("transcript-{}", Uuid::new_v4()),
+                text: turn.text.clone(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                audio_start_time: Some(turn.start),
+                audio_end_time: Some(turn.end),
+                duration: Some(turn.end - turn.start),
+                speaker: turn.speaker.clone(),
+            })
+            .collect(),
+        _ => create_transcript_segments(&all_transcripts),
+    };
 
     // Save to database
     let app_state = app
@@ -719,8 +791,8 @@ async fn create_meeting_with_transcripts(
     // Insert transcripts
     for segment in segments {
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&segment.id)
         .bind(&meeting_id)
@@ -729,6 +801,7 @@ async fn create_meeting_with_transcripts(
         .bind(segment.audio_start_time)
         .bind(segment.audio_end_time)
         .bind(segment.duration)
+        .bind(&segment.speaker)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
@@ -1181,6 +1254,7 @@ mod tests {
                 audio_start_time: Some(0.0),
                 audio_end_time: Some(1.5),
                 duration: Some(1.5),
+                speaker: None,
             },
             TranscriptSegment {
                 id: "t-2".to_string(),
@@ -1189,6 +1263,7 @@ mod tests {
                 audio_start_time: Some(2.0),
                 audio_end_time: Some(3.5),
                 duration: Some(1.5),
+                speaker: None,
             },
         ];
 

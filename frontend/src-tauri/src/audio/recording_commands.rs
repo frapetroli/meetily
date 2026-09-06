@@ -42,6 +42,43 @@ static IS_RECORDING: AtomicBool = AtomicBool::new(false);
 static RECORDING_MANAGER: Mutex<Option<RecordingManager>> = Mutex::new(None);
 static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
+// Diarization session for the current recording, if diarization_enabled -- ADR-0010.
+// `None` when the toggle is off, same lifecycle scope as RECORDING_MANAGER above.
+static DIARIZATION_SESSION: Mutex<Option<crate::diarization::DiarizationSession>> = Mutex::new(None);
+
+// Per-word timestamps accumulated across the whole call while diarization is active
+// (ADR-0013 point 2d), in recording-relative seconds (chunk-relative timestamps from
+// the ASR engines are offset by each chunk's own start time before being pushed here --
+// see `accumulate_word_timestamps`). Drained and merged with the diarization speaker
+// segments at the `diarizing` stage of `stop_recording`.
+static WORD_TIMESTAMPS_ACCUMULATOR: Mutex<Vec<crate::diarization::WordTiming>> = Mutex::new(Vec::new());
+
+/// Whether a diarization session is active for the current recording -- used by
+/// `audio::transcription::worker` to decide whether to request word timestamps from the
+/// ASR engine at all (`include_word_timestamps`), keeping the default (off) path at zero
+/// overhead (ADR-0013).
+pub(crate) fn is_diarization_active() -> bool {
+    DIARIZATION_SESSION.lock().unwrap().is_some()
+}
+
+/// Called by `audio::transcription::worker` for each transcribed chunk when diarization
+/// is active, with the chunk's own word timestamps (relative to the chunk's audio buffer)
+/// and `chunk_start_time` (that chunk's offset from the start of the recording, already
+/// tracked in worker.rs as `chunk_timestamp`). Converts to absolute recording-relative
+/// timestamps before accumulating, matching the convention used by
+/// `diarization::engine::DiarizationEngine`'s speaker segments.
+pub(crate) fn accumulate_word_timestamps(chunk_start_time: f64, words: Vec<crate::diarization::WordTiming>) {
+    if words.is_empty() {
+        return;
+    }
+    let mut accumulator = WORD_TIMESTAMPS_ACCUMULATOR.lock().unwrap();
+    accumulator.extend(words.into_iter().map(|w| crate::diarization::WordTiming {
+        word: w.word,
+        start: w.start + chunk_start_time,
+        end: w.end + chunk_start_time,
+    }));
+}
+
 // Listener ID for proper cleanup - prevents microphone from staying active after recording stops
 static TRANSCRIPT_LISTENER_ID: Mutex<Option<tauri::EventId>> = Mutex::new(None);
 
@@ -105,6 +142,19 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         return Err(validation_error);
     }
     info!("✅ Transcription model validation passed");
+
+    // Diarization (ADR-0010): opt-in, off by default. If enabled but models aren't
+    // downloaded yet, block recording start (roadmap 6h) rather than starting silently
+    // without speakers.
+    let diarization_session = match crate::diarization::DiarizationSession::prepare_if_enabled(&app).await {
+        Ok(session) => session,
+        Err(e) => {
+            error!("Diarization setup failed: {}", e);
+            let _ = app.emit("recording-error", e.clone());
+            return Err(e);
+        }
+    };
+    let diarization_sender = diarization_session.as_ref().map(|s| s.sender());
 
     // Async-first approach - no more blocking operations!
     info!("🚀 Starting async recording initialization");
@@ -234,7 +284,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Start recording with resolved devices (replaces start_recording_with_defaults_and_auto_save call)
     let transcription_receiver = manager
-        .start_recording(microphone_device, system_device, auto_save)
+        .start_recording(microphone_device, system_device, auto_save, diarization_sender)
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
@@ -242,6 +292,12 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
         *global_manager = Some(manager);
+    }
+
+    // Store the diarization session globally to keep it alive and retrieve it in stop_recording
+    {
+        let mut global_session = DIARIZATION_SESSION.lock().unwrap();
+        *global_session = diarization_session;
     }
 
     // Set recording flag and reset speech detection flag
@@ -275,6 +331,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                     display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
                     confidence: update.confidence,
                     sequence_id: update.sequence_id,
+                    speaker: None, // Live path: always None, diarization (if any) replaces this at stop -- ADR-0009
                 };
 
                 // Save to recording manager
@@ -352,6 +409,19 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     }
     info!("✅ Transcription model validation passed");
 
+    // Diarization (ADR-0010): opt-in, off by default. If enabled but models aren't
+    // downloaded yet, block recording start (roadmap 6h) rather than starting silently
+    // without speakers.
+    let diarization_session = match crate::diarization::DiarizationSession::prepare_if_enabled(&app).await {
+        Ok(session) => session,
+        Err(e) => {
+            error!("Diarization setup failed: {}", e);
+            let _ = app.emit("recording-error", e.clone());
+            return Err(e);
+        }
+    };
+    let diarization_sender = diarization_session.as_ref().map(|s| s.sender());
+
     // Parse devices
     let mic_device = if let Some(ref name) = mic_device_name {
         Some(Arc::new(parse_audio_device(name).map_err(|e| {
@@ -405,7 +475,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     // Start recording with specified devices and auto_save setting
     let transcription_receiver = manager
-        .start_recording(mic_device, system_device, auto_save)
+        .start_recording(mic_device, system_device, auto_save, diarization_sender)
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
 
@@ -413,6 +483,12 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     {
         let mut global_manager = RECORDING_MANAGER.lock().unwrap();
         *global_manager = Some(manager);
+    }
+
+    // Store the diarization session globally to keep it alive and retrieve it in stop_recording
+    {
+        let mut global_session = DIARIZATION_SESSION.lock().unwrap();
+        *global_session = diarization_session;
     }
 
     // Set recording flag and reset speech detection flag
@@ -446,6 +522,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
                     display_time: update.timestamp.clone(), // Use wall-clock timestamp for display
                     confidence: update.confidence,
                     sequence_id: update.sequence_id,
+                    speaker: None, // Live path: always None, diarization (if any) replaces this at stop -- ADR-0009
                 };
 
                 // Save to recording manager
@@ -609,6 +686,49 @@ pub async fn stop_recording<R: Runtime>(
     } else {
         info!("ℹ️ No transcription task found to wait for");
     }
+
+    // Diarizing stage (ADR-0009): finalize clustering on all embeddings accumulated
+    // during the call, if diarization was enabled, then merge with the per-word
+    // timestamps accumulated during the call (roadmap 2d) into final speaker turns.
+    // Bookkeeping internal to this stop sequence, not exposed as a separate UI step
+    // (decided in ADR-0014/0015 discussion: "unica esperienza continua per l'utente")
+    // -- stays within the same "processing_transcripts" progress window the user
+    // already sees.
+    //
+    // The frontend remains the sole writer of SQLite (existing invariant, kept
+    // deliberately -- see conversation/roadmap 6c): these turns are attached to the
+    // `recording-stopped` payload below as `diarized_turns`, for the frontend to use
+    // instead of its own live-accumulated segments when it calls `api_save_transcript`.
+    //
+    // TODO(diarization, roadmap 6c/7d): no 10-minute timeout/user choice dialog
+    // implemented yet -- `session.finish()` waits as long as the clustering task takes.
+    let diarization_session = {
+        let mut global_session = DIARIZATION_SESSION.lock().unwrap();
+        global_session.take()
+    };
+    let diarized_turns: Option<Vec<crate::diarization::SpeakerTurn>> = if let Some(session) = diarization_session {
+        info!("🗣️ Finalizing diarization clustering...");
+        let segments = session.finish().await;
+        let words = {
+            let mut accumulator = WORD_TIMESTAMPS_ACCUMULATOR.lock().unwrap();
+            std::mem::take(&mut *accumulator)
+        };
+        let distinct_speakers: std::collections::HashSet<&str> =
+            segments.iter().map(|s| s.speaker.as_str()).collect();
+        info!(
+            "🗣️ Diarization produced {} speaker segments ({} distinct speakers) from {} transcribed words",
+            segments.len(),
+            distinct_speakers.len(),
+            words.len()
+        );
+
+        let words_with_speaker = crate::diarization::assign_word_speakers(&words, &segments);
+        let turns = crate::diarization::group_into_speaker_turns(&words_with_speaker);
+        info!("🗣️ Merged into {} speaker turns", turns.len());
+        Some(turns)
+    } else {
+        None
+    };
 
     // Step 3: Now safely unload Whisper model after ALL chunks are processed
     let _ = app.emit(
@@ -878,16 +998,24 @@ pub async fn stop_recording<R: Runtime>(
         }),
     );
 
-    // Emit final stop event with folder_path and meeting_name for frontend to save
-    app.emit(
-        "recording-stopped",
-        serde_json::json!({
-            "message": "Recording stopped - frontend will save after all transcripts received",
-            "folder_path": folder_path_str,
-            "meeting_name": meeting_name_str
-        }),
-    )
-    .map_err(|e| e.to_string())?;
+    // Emit final stop event with folder_path and meeting_name for frontend to save.
+    // `diarized_turns` (ADR-0009/ADR-0013), when present, is the final speaker-labeled
+    // transcript -- the frontend should use it instead of its own live-accumulated
+    // segments when calling api_save_transcript, since it replaces (not supplements) the
+    // live transcript. Absent (not just empty) when diarization was off or produced no
+    // turns, so existing frontend code that doesn't know about this field is unaffected.
+    let mut stopped_payload = serde_json::json!({
+        "message": "Recording stopped - frontend will save after all transcripts received",
+        "folder_path": folder_path_str,
+        "meeting_name": meeting_name_str
+    });
+    if let Some(turns) = diarized_turns {
+        if !turns.is_empty() {
+            stopped_payload["diarized_turns"] = serde_json::json!(turns);
+        }
+    }
+    app.emit("recording-stopped", stopped_payload)
+        .map_err(|e| e.to_string())?;
 
     // Update tray menu to reflect stopped state
     crate::tray::update_tray_menu(&app);

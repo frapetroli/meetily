@@ -344,10 +344,10 @@ impl ParallelProcessor {
         let language = crate::get_language_preference_internal();
 
         // Transcribe with timeout to prevent hanging
-        let transcription_future = engine.transcribe_audio(chunk.data.clone(), language);
+        let transcription_future = engine.transcribe_audio(chunk.data.clone(), language, false);
         let timeout_duration = tokio::time::Duration::from_secs(120); // 2 minute timeout per chunk
 
-        let text = tokio::time::timeout(timeout_duration, transcription_future)
+        let (text, _word_timestamps) = tokio::time::timeout(timeout_duration, transcription_future)
             .await
             .map_err(|_| anyhow!("Transcription timeout for chunk {}", chunk.id))?
             .map_err(|e| anyhow!("Transcription failed for chunk {}: {}", chunk.id, e))?;

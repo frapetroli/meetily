@@ -106,6 +106,13 @@ silero_rs = { git = "https://github.com/emotechlab/silero-rs", rev = "26a6460", 
 ort = { version = "2.0.0-rc.10" }  # ONNX Runtime for Parakeet models
 thiserror = "2.0.16"                # Error handling for Parakeet
 
+# Speaker diarization (segmentation + embedding + clustering), official k2-fsa crate — see docs/adr/0016
+sherpa-onnx = "1.13"
+# Runtime extraction of the segmentation model archive (.tar.bz2, downloaded on-demand --
+# distinct from the build-time tar/bzip2-family deps above, which only run in build.rs)
+tar = "0.4"
+bzip2 = "0.4"
+
 # Async
 tokio = { version = "1.32.0", features = ["full", "tracing"] }
 tokio-util = "0.7"  # Utilities for tokio including CancellationToken

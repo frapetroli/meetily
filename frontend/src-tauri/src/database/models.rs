@@ -35,6 +35,10 @@ pub struct Transcript {
     pub audio_start_time: Option<f64>,
     pub audio_end_time: Option<f64>,
     pub duration: Option<f64>,
+    /// Speaker label (e.g. "speaker_0"), populated only when diarization produced a
+    /// final merged transcript for this row -- ADR-0009/ADR-0013. `None` for all rows
+    /// saved with diarization off (the default), unchanged from before this field existed.
+    pub speaker: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]

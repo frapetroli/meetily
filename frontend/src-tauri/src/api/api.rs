@@ -137,6 +137,8 @@ pub struct MeetingTranscript {
     pub audio_end_time: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
 }
 
 /// Meeting metadata without transcripts (for pagination)
@@ -188,6 +190,11 @@ pub struct TranscriptSegment {
     pub audio_end_time: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<f64>,
+    /// Speaker label, populated only when diarization produced a final merged
+    /// transcript -- ADR-0009/ADR-0013. Absent (not just `null`) in JSON when `None`,
+    /// same convention as the other optional fields here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -683,6 +690,32 @@ pub async fn api_save_transcript_config<R: Runtime>(
     )
 }
 
+/// Global opt-in diarization toggle (ADR-0010), default `false`. Deliberately separate
+/// from `api_get_transcript_config`/`api_save_transcript_config` above -- see
+/// `SettingsRepository::get_diarization_enabled` for why.
+#[tauri::command]
+pub async fn api_get_diarization_enabled<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let pool = state.db_manager.pool();
+    SettingsRepository::get_diarization_enabled(pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn api_save_diarization_enabled<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    SettingsRepository::save_diarization_enabled(pool, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn api_get_transcript_api_key<R: Runtime>(
     _app: AppHandle<R>,
@@ -878,6 +911,7 @@ pub async fn api_get_meeting_transcripts<R: Runtime>(
                     audio_start_time: t.audio_start_time,
                     audio_end_time: t.audio_end_time,
                     duration: t.duration,
+                    speaker: t.speaker,
                 })
                 .collect::<Vec<_>>();
 

@@ -1,4 +1,5 @@
-use crate::parakeet_engine::model::ParakeetModel;
+use crate::parakeet_engine::model::{ParakeetModel, TimestampedResult};
+use crate::diarization::WordTiming;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -451,7 +452,16 @@ impl ParakeetEngine {
     }
 
     /// Transcribe audio samples using the loaded Parakeet model
-    pub async fn transcribe_audio(&self, audio_data: Vec<f32>) -> Result<String> {
+    /// `include_word_timestamps` gates the diarization word-timestamp reconstruction
+    /// (ADR-0013): `false` (default, diarization off) is identical in behavior/cost to
+    /// before this parameter existed -- `result.timestamps`/`result.tokens` are already
+    /// computed unconditionally by `transcribe_samples()` either way (that part isn't
+    /// new), only the reconstruction into `WordTiming`s is skipped.
+    pub async fn transcribe_audio(
+        &self,
+        audio_data: Vec<f32>,
+        include_word_timestamps: bool,
+    ) -> Result<(String, Option<Vec<WordTiming>>)> {
         let mut model_guard = self.current_model.write().await;
         let model = model_guard
             .as_mut()
@@ -471,7 +481,47 @@ impl ParakeetEngine {
 
         log::debug!("Parakeet transcription result: '{}'", result.text);
 
-        Ok(result.text)
+        let word_timestamps = if include_word_timestamps {
+            Some(Self::reconstruct_word_timestamps(&result))
+        } else {
+            None
+        };
+
+        Ok((result.text, word_timestamps))
+    }
+
+    /// Reconstructs per-word timestamps from Parakeet's per-token output (already in
+    /// seconds, not frame indices -- verified in `model.rs::decode_tokens()`; tokens
+    /// already carry a literal leading space at word boundaries, `model.rs:165`). Unlike
+    /// whisper.cpp, Parakeet gives one timestamp *point* per token, not a (t0, t1) pair,
+    /// so a word's end is approximated as the start of the next word (the last word's
+    /// end falls back to its own last token's timestamp, i.e. zero extra duration).
+    fn reconstruct_word_timestamps(result: &TimestampedResult) -> Vec<WordTiming> {
+        let mut words: Vec<WordTiming> = Vec::new();
+        for (token, &ts) in result.tokens.iter().zip(result.timestamps.iter()) {
+            let trimmed = token.trim_start();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let starts_new_word = words.is_empty() || token.starts_with(' ');
+            if starts_new_word {
+                words.push(WordTiming {
+                    word: trimmed.to_string(),
+                    start: ts as f64,
+                    end: ts as f64,
+                });
+            } else if let Some(word) = words.last_mut() {
+                word.word.push_str(trimmed);
+                word.end = ts as f64;
+            }
+        }
+        // Close gaps: each word's end becomes the next word's start, so the merge
+        // (assign_word_speakers) sees a contiguous timeline instead of point-like words.
+        let starts: Vec<f64> = words.iter().skip(1).map(|w| w.start).collect();
+        for (word, next_start) in words.iter_mut().zip(starts) {
+            word.end = next_start;
+        }
+        words
     }
 
     /// Get the models directory path

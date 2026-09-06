@@ -172,6 +172,39 @@ impl SettingsRepository {
         Ok(())
     }
 
+    /// Global opt-in toggle (ADR-0010), default `false`. Deliberately not part of
+    /// `TranscriptSetting`/`get_transcript_config()` (which map `SELECT *` and are
+    /// consumed widely, including by the frontend's `TranscriptConfig` type) -- a
+    /// dedicated targeted query keeps this addition low-blast-radius.
+    pub async fn get_diarization_enabled(pool: &SqlitePool) -> std::result::Result<bool, sqlx::Error> {
+        let enabled: Option<bool> = sqlx::query_scalar(
+            "SELECT diarization_enabled FROM transcript_settings WHERE id = '1' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await?;
+        Ok(enabled.unwrap_or(false))
+    }
+
+    pub async fn save_diarization_enabled(
+        pool: &SqlitePool,
+        enabled: bool,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO transcript_settings (id, provider, model, diarization_enabled)
+            VALUES ('1', 'parakeet', $1, $2)
+            ON CONFLICT(id) DO UPDATE SET
+                diarization_enabled = excluded.diarization_enabled
+            "#,
+        )
+        .bind(crate::config::DEFAULT_PARAKEET_MODEL)
+        .bind(enabled)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn save_transcript_api_key(
         pool: &SqlitePool,
         provider: &str,

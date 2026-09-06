@@ -16,10 +16,22 @@ export interface RecordingState {
   active_duration: number | null;
 }
 
+// One continuous speaker turn produced by the diarization merge (Rust: diarization::merge::SpeakerTurn).
+// Mirrors the JSON shape of that struct exactly.
+export interface DiarizedSpeakerTurn {
+  speaker: string | null;
+  text: string;
+  start: number;
+  end: number;
+}
+
 export interface RecordingStoppedPayload {
   message: string;
   folder_path?: string;
   meeting_name?: string;
+  // Present only when diarization was enabled and produced turns (ADR-0009/ADR-0013).
+  // Replaces (not supplements) the live-accumulated transcript when saving -- see useRecordingStop.ts.
+  diarized_turns?: DiarizedSpeakerTurn[];
 }
 
 /**

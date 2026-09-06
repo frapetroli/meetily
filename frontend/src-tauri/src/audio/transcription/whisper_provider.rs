@@ -23,16 +23,18 @@ impl TranscriptionProvider for WhisperProvider {
         &self,
         audio: Vec<f32>,
         language: Option<String>,
+        include_word_timestamps: bool,
     ) -> std::result::Result<TranscriptResult, TranscriptionError> {
         match self
             .engine
-            .transcribe_audio_with_confidence(audio, language)
+            .transcribe_audio_with_confidence(audio, language, include_word_timestamps)
             .await
         {
-            Ok((text, confidence, is_partial)) => Ok(TranscriptResult {
+            Ok((text, confidence, is_partial, word_timestamps)) => Ok(TranscriptResult {
                 text: text.trim().to_string(),
                 confidence: Some(confidence),
                 is_partial,
+                word_timestamps,
             }),
             Err(e) => Err(TranscriptionError::EngineFailed(e.to_string())),
         }

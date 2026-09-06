@@ -6,14 +6,76 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
-use whisper_rs::{WhisperContext, WhisperContextParameters, FullParams, SamplingStrategy};
+use whisper_rs::{WhisperContext, WhisperContextParameters, WhisperState, FullParams, SamplingStrategy};
 use serde::{Serialize, Deserialize};
 use anyhow::{Result, anyhow};
 use reqwest::Client;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use crate::config::WHISPER_MODEL_CATALOG;
+use crate::diarization::WordTiming;
 use super::acceleration::{whisper_context_acceleration_for, WhisperCompiledBackend};
+
+/// Reconstructs per-word timestamps from whisper.cpp's per-token output.
+///
+/// Only called when `diarization_enabled` is on (ADR-0013) -- gated by the
+/// `include_word_timestamps` parameter of `transcribe_audio`/`transcribe_audio_with_confidence`,
+/// never on the default hot path. `set_token_timestamps(true)` is already active
+/// unconditionally in both functions (was already the case before this change, for
+/// unrelated historical reasons -- see the comment there), so `full_get_token_data` is
+/// always available; this function just stops discarding it.
+///
+/// whisper.cpp tokens are sub-word (BPE): a token whose text starts with a literal space
+/// begins a new word, everything else is a continuation of the current word -- same
+/// technique used by whisper-timestamped and other whisper.cpp-based tools. Special
+/// tokens (timestamps, BOS/EOS, etc.) are rendered by whisper.cpp as bracketed text like
+/// `[_BEG_]`/`[_TT_123]` and are skipped.
+fn extract_word_timestamps(state: &WhisperState, num_segments: i32) -> Vec<WordTiming> {
+    let mut words = Vec::new();
+    // (accumulated_text, start_secs, end_secs) for the word currently being built.
+    let mut current: Option<(String, f64, f64)> = None;
+
+    for segment in 0..num_segments {
+        let n_tokens = match state.full_n_tokens(segment) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        for token in 0..n_tokens {
+            let token_text = match state.full_get_token_text(segment, token) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if token_text.starts_with('[') {
+                continue; // special/timestamp token, not real text
+            }
+            let trimmed = token_text.trim_start();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let token_data = match state.full_get_token_data(segment, token) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let t0 = token_data.t0 as f64 / 100.0; // whisper.cpp timestamps are in centiseconds
+            let t1 = token_data.t1 as f64 / 100.0;
+
+            let starts_new_word = current.is_none() || token_text.starts_with(' ');
+            if starts_new_word {
+                if let Some((text, start, end)) = current.take() {
+                    words.push(WordTiming { word: text, start, end });
+                }
+                current = Some((trimmed.to_string(), t0, t1));
+            } else if let Some(word) = current.as_mut() {
+                word.0.push_str(trimmed);
+                word.2 = t1;
+            }
+        }
+    }
+    if let Some((text, start, end)) = current.take() {
+        words.push(WordTiming { word: text, start, end });
+    }
+    words
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ModelStatus {
@@ -547,8 +609,13 @@ impl WhisperEngine {
         repeated_words as f32 / total_words
     }
     
-    /// Transcribe audio with streaming support for partial results and adaptive quality
-    pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<(String, f32, bool)> {
+    /// Transcribe audio with streaming support for partial results and adaptive quality.
+    ///
+    /// `include_word_timestamps` gates the diarization word-timestamp extraction
+    /// (ADR-0013): when `false` (the default, diarization toggle off), behavior and cost
+    /// are identical to before this parameter existed. When `true`, the returned
+    /// `Option<Vec<WordTiming>>` is populated.
+    pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>, include_word_timestamps: bool) -> Result<(String, f32, bool, Option<Vec<WordTiming>>)> {
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
@@ -662,10 +729,25 @@ impl WhisperEngine {
             0.0
         };
 
-        Ok((cleaned_result, avg_confidence, is_partial))
+        // Raw (pre-cleanup) per-word timestamps -- ADR-0013 requires the diarization
+        // merge to run on data unaffected by clean_repetitive_text's rewriting of the
+        // display string, so this is intentionally extracted from `state` directly,
+        // not from `cleaned_result`. Known gap (roadmap item 2e, not yet done): if
+        // clean_repetitive_text drops repeated words from `cleaned_result`, this list
+        // still contains them -- the merge module doesn't yet filter it to match.
+        let word_timestamps = if include_word_timestamps {
+            Some(extract_word_timestamps(&state, num_segments))
+        } else {
+            None
+        };
+
+        Ok((cleaned_result, avg_confidence, is_partial, word_timestamps))
     }
 
-    pub async fn transcribe_audio(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<String> {
+    /// `include_word_timestamps` gates the diarization word-timestamp extraction
+    /// (ADR-0013), same contract as `transcribe_audio_with_confidence`. Used by the
+    /// batch paths (`import.rs`/`retranscription.rs`).
+    pub async fn transcribe_audio(&self, audio_data: Vec<f32>, language: Option<String>, include_word_timestamps: bool) -> Result<(String, Option<Vec<WordTiming>>)> {
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
@@ -835,7 +917,15 @@ impl WhisperEngine {
             }
         }
 
-        Ok(cleaned_result)
+        // See the identical comment in transcribe_audio_with_confidence: raw
+        // (pre-cleanup) timestamps, intentionally not filtered by clean_repetitive_text.
+        let word_timestamps = if include_word_timestamps {
+            Some(extract_word_timestamps(&state, num_segments))
+        } else {
+            None
+        };
+
+        Ok((cleaned_result, word_timestamps))
     }
     
     pub async fn get_models_directory(&self) -> PathBuf {

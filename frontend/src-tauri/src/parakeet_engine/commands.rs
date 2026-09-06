@@ -352,8 +352,9 @@ pub async fn parakeet_transcribe_audio(audio_data: Vec<f32>) -> Result<String, S
 
     if let Some(engine) = engine {
         engine
-            .transcribe_audio(audio_data)
+            .transcribe_audio(audio_data, false)
             .await
+            .map(|(text, _word_timestamps)| text)
             .map_err(|e| format!("Parakeet transcription failed: {}", e))
     } else {
         Err("Parakeet engine not initialized".to_string())

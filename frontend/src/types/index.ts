@@ -16,6 +16,9 @@ export interface Transcript {
   audio_start_time?: number; // Seconds from recording start (e.g., 125.3)
   audio_end_time?: number;   // Seconds from recording start (e.g., 128.6)
   duration?: number;          // Segment duration in seconds (e.g., 3.3)
+  // Speaker label (e.g. "speaker_0"), populated only when diarization produced this
+  // segment (ADR-0009/ADR-0013). Absent for live-accumulated segments.
+  speaker?: string | null;
 }
 
 export interface TranscriptUpdate {
@@ -107,4 +110,7 @@ export interface TranscriptSegmentData {
   endTime?: number; // audio_end_time in seconds
   text: string;
   confidence?: number;
+  // Speaker label (e.g. "speaker_0"), populated only when diarization produced this
+  // segment (ADR-0009/ADR-0013). Absent for non-diarized transcripts.
+  speaker?: string | null;
 }

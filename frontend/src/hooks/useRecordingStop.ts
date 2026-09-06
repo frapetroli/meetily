@@ -7,6 +7,8 @@ import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
+import { DiarizedSpeakerTurn } from '@/services/recordingService';
+import { Transcript } from '@/types';
 import Analytics from '@/lib/analytics';
 import {
   applyPinnedSummaryLanguageToMeeting,
@@ -75,6 +77,11 @@ export function useRecordingStop(
   // Promise to track recording-stopped event data (fixes race condition with recording-stop-complete)
   const recordingStoppedDataRef = useRef<Promise<void> | null>(null);
 
+  // Final speaker-labeled transcript from diarization (ADR-0009/ADR-0013), if the
+  // recording-stopped event carried one. When present, this replaces (not supplements)
+  // the live-accumulated transcript when saving to SQLite below.
+  const diarizedTurnsRef = useRef<DiarizedSpeakerTurn[] | null>(null);
+
   // Set up recording-stopped listener for meeting navigation
   useEffect(() => {
     let unlistenFn: (() => void) | undefined;
@@ -86,10 +93,11 @@ export function useRecordingStop(
           message: string;
           folder_path?: string;
           meeting_name?: string;
+          diarized_turns?: DiarizedSpeakerTurn[];
         }>('recording-stopped', async (event) => {
           // Create promise that resolves when sessionStorage is set (prevents race condition)
           recordingStoppedDataRef.current = (async () => {
-            const { folder_path, meeting_name } = event.payload;
+            const { folder_path, meeting_name, diarized_turns } = event.payload;
 
             // Store folder_path and meeting_name for later use in handleRecordingStop
             if (folder_path) {
@@ -98,6 +106,7 @@ export function useRecordingStop(
             if (meeting_name) {
               sessionStorage.setItem('last_recording_meeting_name', meeting_name);
             }
+            diarizedTurnsRef.current = diarized_turns && diarized_turns.length > 0 ? diarized_turns : null;
           })();
 
         });
@@ -237,8 +246,25 @@ export function useRecordingStop(
 
         setStatus(RecordingStatus.SAVING, 'Saving meeting to database...');
 
-        // Get fresh transcript state (ALL transcripts including late ones)
-        const freshTranscripts = [...transcriptsRef.current];
+        // Get fresh transcript state (ALL transcripts including late ones), unless
+        // diarization produced a final speaker-labeled transcript -- that one replaces
+        // the live-accumulated one entirely (ADR-0009: "sostituzione, non doppio
+        // salvataggio"), not just supplements it.
+        const diarizedTurns = diarizedTurnsRef.current;
+        const freshTranscripts: Transcript[] = diarizedTurns
+          ? diarizedTurns.map((turn, index) => ({
+              id: `diarized-${index}`,
+              text: turn.text,
+              timestamp: new Date().toISOString(),
+              audio_start_time: turn.start,
+              audio_end_time: turn.end,
+              duration: turn.end - turn.start,
+              speaker: turn.speaker ?? undefined,
+            }))
+          : [...transcriptsRef.current];
+        if (diarizedTurns) {
+          console.log(`🗣️ Using ${diarizedTurns.length} diarized speaker turns instead of the live-accumulated transcript`);
+        }
 
         // Get folder_path and meeting_name from recording-stopped event
         const folderPath = sessionStorage.getItem('last_recording_folder_path');
@@ -301,6 +327,8 @@ export function useRecordingStop(
           sessionStorage.removeItem('last_recording_meeting_name');
           // Clean up IndexedDB meeting ID (redundant with markMeetingAsSaved cleanup, but ensures cleanup)
           sessionStorage.removeItem('indexeddb_current_meeting_id');
+          // Avoid leaking this recording's diarized turns into a subsequent one
+          diarizedTurnsRef.current = null;
 
           // Refetch meetings and set current meeting
           await refetchMeetings();

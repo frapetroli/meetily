@@ -22,6 +22,10 @@ pub struct TranscriptSegment {
     pub display_time: String,   // Formatted time for display like "[02:15]"
     pub confidence: f32,
     pub sequence_id: u64,
+    /// Speaker label, populated only when diarization produced a final merged
+    /// transcript (ADR-0009/ADR-0013) -- always `None` on the live in-memory path today.
+    #[serde(default)]
+    pub speaker: Option<String>,
 }
 
 /// Meeting metadata structure
@@ -129,6 +133,7 @@ impl RecordingSaver {
             display_time: "[00:00]".to_string(),
             confidence: 1.0,
             sequence_id: 0,
+            speaker: None,
         };
         self.add_transcript_segment(segment);
     }

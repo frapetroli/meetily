@@ -149,15 +149,22 @@ pub fn start_transcription_task<R: Runtime>(
                             let chunk_timestamp = chunk.timestamp;
                             let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
 
-                            // Transcribe with provider-agnostic approach
+                            // Transcribe with provider-agnostic approach. `include_word_timestamps`
+                            // reflects whether a diarization session is active for this recording
+                            // (ADR-0013) -- `false` (the default) costs nothing extra in the engines.
+                            let include_word_timestamps = crate::audio::recording_commands::is_diarization_active();
                             match transcribe_chunk_with_provider(
                                 &engine_clone,
                                 chunk,
                                 &app_clone,
+                                include_word_timestamps,
                             )
                             .await
                             {
-                                Ok((transcript, confidence_opt, is_partial)) => {
+                                Ok((transcript, confidence_opt, is_partial, word_timestamps)) => {
+                                    if let Some(words) = word_timestamps {
+                                        crate::audio::recording_commands::accumulate_word_timestamps(chunk_timestamp, words);
+                                    }
                                     let confidence_str = match confidence_opt {
                                         Some(c) => format!("{:.2}", c),
                                         None => "N/A".to_string(),
@@ -395,12 +402,20 @@ pub fn start_transcription_task<R: Runtime>(
 }
 
 /// Transcribe audio chunk using the appropriate provider (Whisper, Parakeet, or trait-based)
-/// Returns: (text, confidence Option, is_partial)
+/// Returns: (text, confidence Option, is_partial, word_timestamps)
+///
+/// `include_word_timestamps` gates the diarization word-timestamp extraction (ADR-0013).
+/// Currently always called with `false` -- the toggle-read plumbing and the internal
+/// channel that would carry `word_timestamps` to the diarization orchestrator are not
+/// wired up yet (tracked separately), so this parameter exists but has no live caller
+/// passing `true` yet. Passing `false` keeps behavior/cost identical to before this
+/// parameter existed.
 async fn transcribe_chunk_with_provider<R: Runtime>(
     engine: &TranscriptionEngine,
     chunk: AudioChunk,
     app: &AppHandle<R>,
-) -> std::result::Result<(String, Option<f32>, bool), TranscriptionError> {
+    include_word_timestamps: bool,
+) -> std::result::Result<(String, Option<f32>, bool, Option<Vec<crate::diarization::WordTiming>>), TranscriptionError> {
     // Convert to 16kHz mono for transcription
     let transcription_data = if chunk.sample_rate != 16000 {
         crate::audio::audio_processing::resample_audio(&chunk.data, chunk.sample_rate, 16000)
@@ -440,13 +455,13 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
             let language = crate::get_language_preference_internal();
 
             match whisper_engine
-                .transcribe_audio_with_confidence(speech_samples, language)
+                .transcribe_audio_with_confidence(speech_samples, language, include_word_timestamps)
                 .await
             {
-                Ok((text, confidence, is_partial)) => {
+                Ok((text, confidence, is_partial, word_timestamps)) => {
                     let cleaned_text = text.trim().to_string();
                     if cleaned_text.is_empty() {
-                        return Ok((String::new(), Some(confidence), is_partial));
+                        return Ok((String::new(), Some(confidence), is_partial, word_timestamps));
                     }
 
                     info!(
@@ -454,7 +469,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                         chunk.chunk_id, cleaned_text, confidence, is_partial
                     );
 
-                    Ok((cleaned_text, Some(confidence), is_partial))
+                    Ok((cleaned_text, Some(confidence), is_partial, word_timestamps))
                 }
                 Err(e) => {
                     error!(
@@ -477,11 +492,11 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
             }
         }
         TranscriptionEngine::Parakeet(parakeet_engine) => {
-            match parakeet_engine.transcribe_audio(speech_samples).await {
-                Ok(text) => {
+            match parakeet_engine.transcribe_audio(speech_samples, include_word_timestamps).await {
+                Ok((text, word_timestamps)) => {
                     let cleaned_text = text.trim().to_string();
                     if cleaned_text.is_empty() {
-                        return Ok((String::new(), None, false));
+                        return Ok((String::new(), None, false, word_timestamps));
                     }
 
                     info!(
@@ -490,7 +505,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                     );
 
                     // Parakeet doesn't provide confidence or partial results
-                    Ok((cleaned_text, None, false))
+                    Ok((cleaned_text, None, false, word_timestamps))
                 }
                 Err(e) => {
                     error!(
@@ -516,11 +531,11 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
             // NEW: Trait-based provider (clean, unified interface)
             let language = crate::get_language_preference_internal();
 
-            match provider.transcribe(speech_samples, language).await {
+            match provider.transcribe(speech_samples, language, include_word_timestamps).await {
                 Ok(result) => {
                     let cleaned_text = result.text.trim().to_string();
                     if cleaned_text.is_empty() {
-                        return Ok((String::new(), result.confidence, result.is_partial));
+                        return Ok((String::new(), result.confidence, result.is_partial, result.word_timestamps));
                     }
 
                     let confidence_str = match result.confidence {
@@ -537,7 +552,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                         result.is_partial
                     );
 
-                    Ok((cleaned_text, result.confidence, result.is_partial))
+                    Ok((cleaned_text, result.confidence, result.is_partial, result.word_timestamps))
                 }
                 Err(e) => {
                     error!(
