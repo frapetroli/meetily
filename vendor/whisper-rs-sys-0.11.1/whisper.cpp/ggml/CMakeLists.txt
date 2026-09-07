@@ -1,4 +1,13 @@
 cmake_minimum_required(VERSION 3.14) # for add_link_options and implicit target directories.
+# Patched locally, mirrors the same guard in ../CMakeLists.txt (see
+# docs/adr/0019-crt-statico-whisper-cpp-windows-conflitto-sherpa-onnx-sys.md in the docs
+# workspace): this file's own cmake_minimum_required(3.14) is below 3.15 and would
+# otherwise reset CMP0091 back to OLD for this subdirectory scope, silently undoing the
+# parent CMakeLists.txt's policy setting right where most of the actual compilation
+# happens.
+if(POLICY CMP0091)
+    cmake_policy(SET CMP0091 NEW)
+endif()
 project("ggml" C CXX)
 include(CheckIncludeFileCXX)
 

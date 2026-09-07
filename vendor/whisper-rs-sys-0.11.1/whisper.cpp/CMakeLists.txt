@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.5) # for add_link_options and implicit target directories.
+# Patched locally (see docs/adr/0019-crt-statico-whisper-cpp-windows-conflitto-sherpa-onnx-sys.md
+# in the docs workspace, outside this repo): must be set before project() so that
+# CMAKE_MSVC_RUNTIME_LIBRARY (set from build.rs) actually controls /MT vs /MD, instead of
+# being silently ignored. Needed because cmake-rs's Config::static_crt() only works with the
+# default Visual Studio generator, not with the Ninja generator this build forces on Windows.
+if(POLICY CMP0091)
+    cmake_policy(SET CMP0091 NEW)
+endif()
 project("whisper.cpp" C CXX)
 project("whisper.cpp" VERSION 1.7.1)
 include(CheckIncludeFileCXX)

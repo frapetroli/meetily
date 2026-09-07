@@ -233,15 +233,26 @@ fn main() {
     }
 
     if target.contains("msvc") {
-        // Force the static CRT (/MT) on MSVC. cmake-rs defaults to /MD (static_crt(false)),
+        // Force the static CRT (/MT, or /MTd in debug) on MSVC. cmake-rs defaults to /MD,
         // which conflicts with sherpa-onnx-sys's prebuilt ONNX Runtime libraries (linked
         // /MT) -- two incompatible copies of the CRT in the same binary cause
-        // LNK2038/LNK1169 duplicate-symbol errors at link time. whisper.cpp's
-        // CMakeLists.txt predates CMP0091, so the "proper"
-        // CMAKE_MSVC_RUNTIME_LIBRARY property is silently ignored by CMake; static_crt()
-        // is cmake-rs's own supported mechanism for this (delegates to the `cc` crate),
-        // not a guessed flags string. See docs/adr/0019 in the docs workspace.
-        config.static_crt(true);
+        // LNK2038/LNK1169 duplicate-symbol errors at link time.
+        //
+        // NOTE: cmake-rs's own Config::static_crt() mechanism (tried first) only patches
+        // CMAKE_<LANG>_FLAGS_<CONFIG> when cmake-rs is using the *default* (Visual Studio
+        // project) generator -- it's a no-op when CMAKE_GENERATOR=Ninja is set (as this
+        // workspace's Windows dev setup does, to sidestep an unrelated CMake
+        // VS-instance-detection bug), so CMake's own built-in /MD default for
+        // RelWithDebInfo silently wins instead. Use the real, generator-agnostic CMake
+        // mechanism instead: the CMAKE_MSVC_RUNTIME_LIBRARY cache variable. This only
+        // takes effect because whisper.cpp's CMakeLists.txt/ggml/CMakeLists.txt have been
+        // patched locally to opt into CMP0091 (see docs/adr/0019 in the docs workspace) --
+        // without that, CMake silently ignores this variable entirely on older policy
+        // versions, which is exactly the trap that led to the static_crt() attempt above.
+        config.define(
+            "CMAKE_MSVC_RUNTIME_LIBRARY",
+            "MultiThreaded$<$<CONFIG:Debug>:Debug>",
+        );
     }
 
     // Allow passing any WHISPER or CMAKE compile flags
