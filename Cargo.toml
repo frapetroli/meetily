@@ -16,3 +16,11 @@ anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.32.0", features = ["full"] }
+
+# Vendored, locally patched whisper-rs-sys 0.11.1 (bindgen bumped 0.69 -> 0.72, static CRT
+# forced on MSVC) -- see vendor/whisper-rs-sys-0.11.1/Cargo.toml and
+# docs/adr/0018-vendoring-whisper-rs-sys-bindgen-072-bug-msvc.md /
+# docs/adr/0019-crt-statico-whisper-cpp-windows-conflitto-sherpa-onnx-sys.md in the docs
+# workspace for why.
+[patch.crates-io]
+whisper-rs-sys = { path = "vendor/whisper-rs-sys-0.11.1" }
