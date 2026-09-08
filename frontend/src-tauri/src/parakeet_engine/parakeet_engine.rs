@@ -1136,3 +1136,70 @@ impl ParakeetEngine {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- reconstruct_word_timestamps (roadmap 9c: propagation of Parakeet's per-token
+    // timestamps into per-word timings) --------------------------------------------------
+
+    fn timestamped(tokens: &[&str], timestamps: &[f32]) -> TimestampedResult {
+        TimestampedResult {
+            text: String::new(),
+            tokens: tokens.iter().map(|t| t.to_string()).collect(),
+            timestamps: timestamps.to_vec(),
+        }
+    }
+
+    #[test]
+    fn reconstruct_word_timestamps_joins_continuation_tokens_into_one_word() {
+        // "Hello" split into two sub-word tokens, as model.rs::decode_tokens() would emit it
+        // (leading space already embedded in the first token, per model.rs:165).
+        let result = timestamped(&[" Hel", "lo"], &[0.0, 0.2]);
+        let words = ParakeetEngine::reconstruct_word_timestamps(&result);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].word, "Hello");
+        assert_eq!(words[0].start, 0.0);
+        assert_eq!(words[0].end, 0.2);
+    }
+
+    #[test]
+    fn reconstruct_word_timestamps_closes_gaps_between_words_but_not_after_the_last_one() {
+        let result = timestamped(&[" Hello", " world"], &[0.0, 0.5]);
+        let words = ParakeetEngine::reconstruct_word_timestamps(&result);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].word, "Hello");
+        assert_eq!(words[0].start, 0.0);
+        // Gap-closed: word 0's end becomes word 1's start, not its own last token.
+        assert_eq!(words[0].end, 0.5);
+        assert_eq!(words[1].word, "world");
+        assert_eq!(words[1].start, 0.5);
+        // Last word has no following word to close the gap with -- falls back to its own
+        // last token's timestamp (zero extra duration), per the function's doc comment.
+        assert_eq!(words[1].end, 0.5);
+    }
+
+    #[test]
+    fn reconstruct_word_timestamps_treats_the_very_first_token_as_a_new_word_even_without_a_leading_space() {
+        let result = timestamped(&["Hello"], &[0.0]);
+        let words = ParakeetEngine::reconstruct_word_timestamps(&result);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].word, "Hello");
+    }
+
+    #[test]
+    fn reconstruct_word_timestamps_skips_tokens_that_are_only_whitespace() {
+        let result = timestamped(&[" Hello", " ", " world"], &[0.0, 0.3, 0.5]);
+        let words = ParakeetEngine::reconstruct_word_timestamps(&result);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].word, "Hello");
+        assert_eq!(words[1].word, "world");
+    }
+
+    #[test]
+    fn reconstruct_word_timestamps_returns_empty_for_no_tokens() {
+        let result = timestamped(&[], &[]);
+        assert!(ParakeetEngine::reconstruct_word_timestamps(&result).is_empty());
+    }
+}

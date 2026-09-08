@@ -31,10 +31,10 @@ use super::acceleration::{whisper_context_acceleration_for, WhisperCompiledBacke
 /// tokens (timestamps, BOS/EOS, etc.) are rendered by whisper.cpp as bracketed text like
 /// `[_BEG_]`/`[_TT_123]` and are skipped.
 fn extract_word_timestamps(state: &WhisperState, num_segments: i32) -> Vec<WordTiming> {
-    let mut words = Vec::new();
-    // (accumulated_text, start_secs, end_secs) for the word currently being built.
-    let mut current: Option<(String, f64, f64)> = None;
-
+    // Flatten every segment's tokens into one (text, t0_secs, t1_secs) sequence first --
+    // keeps the whisper.cpp FFI calls (untestable without a loaded model) separate from
+    // the merge algorithm below (pure, unit-tested in `mod tests`).
+    let mut tokens: Vec<(String, f64, f64)> = Vec::new();
     for segment in 0..num_segments {
         let n_tokens = match state.full_n_tokens(segment) {
             Ok(n) => n,
@@ -45,30 +45,47 @@ fn extract_word_timestamps(state: &WhisperState, num_segments: i32) -> Vec<WordT
                 Ok(t) => t,
                 Err(_) => continue,
             };
-            if token_text.starts_with('[') {
-                continue; // special/timestamp token, not real text
-            }
-            let trimmed = token_text.trim_start();
-            if trimmed.is_empty() {
-                continue;
-            }
             let token_data = match state.full_get_token_data(segment, token) {
                 Ok(d) => d,
                 Err(_) => continue,
             };
             let t0 = token_data.t0 as f64 / 100.0; // whisper.cpp timestamps are in centiseconds
             let t1 = token_data.t1 as f64 / 100.0;
+            tokens.push((token_text, t0, t1));
+        }
+    }
+    merge_tokens_into_words(&tokens)
+}
 
-            let starts_new_word = current.is_none() || token_text.starts_with(' ');
-            if starts_new_word {
-                if let Some((text, start, end)) = current.take() {
-                    words.push(WordTiming { word: text, start, end });
-                }
-                current = Some((trimmed.to_string(), t0, t1));
-            } else if let Some(word) = current.as_mut() {
-                word.0.push_str(trimmed);
-                word.2 = t1;
+/// Merges a flat, in-order sequence of (token_text, t0_secs, t1_secs) triples -- whisper.cpp's
+/// sub-word (BPE) token output -- into per-word timings. A token whose text starts with a
+/// literal space begins a new word, everything else is a continuation of the current word --
+/// same technique used by whisper-timestamped and other whisper.cpp-based tools. Special
+/// tokens (timestamps, BOS/EOS, etc.) are rendered by whisper.cpp as bracketed text like
+/// `[_BEG_]`/`[_TT_123]` and are skipped, same as tokens that trim to nothing.
+fn merge_tokens_into_words(tokens: &[(String, f64, f64)]) -> Vec<WordTiming> {
+    let mut words = Vec::new();
+    // (accumulated_text, start_secs, end_secs) for the word currently being built.
+    let mut current: Option<(String, f64, f64)> = None;
+
+    for (token_text, t0, t1) in tokens {
+        if token_text.starts_with('[') {
+            continue; // special/timestamp token, not real text
+        }
+        let trimmed = token_text.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let starts_new_word = current.is_none() || token_text.starts_with(' ');
+        if starts_new_word {
+            if let Some((text, start, end)) = current.take() {
+                words.push(WordTiming { word: text, start, end });
             }
+            current = Some((trimmed.to_string(), *t0, *t1));
+        } else if let Some(word) = current.as_mut() {
+            word.0.push_str(trimmed);
+            word.2 = *t1;
         }
     }
     if let Some((text, start, end)) = current.take() {
@@ -1892,5 +1909,78 @@ mod tests {
         assert!(!model_path.exists());
         let models = engine.discover_models().await.unwrap();
         assert!(matches!(tiny_model(&models).status, ModelStatus::Missing));
+    }
+
+    // -- merge_tokens_into_words (roadmap 9c: word-from-token reconstruction) --------------
+
+    #[test]
+    fn merge_tokens_into_words_joins_bpe_continuations_into_one_word() {
+        // "Hello" split into two sub-word tokens, as whisper.cpp would emit it.
+        let tokens = vec![
+            (" Hel".to_string(), 0.0, 0.2),
+            ("lo".to_string(), 0.2, 0.4),
+        ];
+        let words = merge_tokens_into_words(&tokens);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].word, "Hello");
+        assert_eq!(words[0].start, 0.0);
+        assert_eq!(words[0].end, 0.4);
+    }
+
+    #[test]
+    fn merge_tokens_into_words_splits_on_leading_space() {
+        let tokens = vec![
+            (" Hello".to_string(), 0.0, 0.3),
+            (" world".to_string(), 0.3, 0.6),
+        ];
+        let words = merge_tokens_into_words(&tokens);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].word, "Hello");
+        assert_eq!(words[0].start, 0.0);
+        assert_eq!(words[0].end, 0.3);
+        assert_eq!(words[1].word, "world");
+        assert_eq!(words[1].start, 0.3);
+        assert_eq!(words[1].end, 0.6);
+    }
+
+    #[test]
+    fn merge_tokens_into_words_treats_the_very_first_token_as_a_new_word_even_without_a_leading_space() {
+        // whisper.cpp doesn't always prefix the first real token of a segment with a space.
+        let tokens = vec![("Hello".to_string(), 0.0, 0.3)];
+        let words = merge_tokens_into_words(&tokens);
+        assert_eq!(words.len(), 1);
+        assert_eq!(words[0].word, "Hello");
+    }
+
+    #[test]
+    fn merge_tokens_into_words_skips_bracketed_special_tokens() {
+        let tokens = vec![
+            ("[_BEG_]".to_string(), 0.0, 0.0),
+            (" Hello".to_string(), 0.0, 0.3),
+            ("[_TT_123]".to_string(), 0.3, 0.3),
+            (" world".to_string(), 0.3, 0.6),
+        ];
+        let words = merge_tokens_into_words(&tokens);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].word, "Hello");
+        assert_eq!(words[1].word, "world");
+    }
+
+    #[test]
+    fn merge_tokens_into_words_skips_tokens_that_are_only_whitespace() {
+        let tokens = vec![
+            (" Hello".to_string(), 0.0, 0.3),
+            (" ".to_string(), 0.3, 0.3),
+            (" world".to_string(), 0.3, 0.6),
+        ];
+        let words = merge_tokens_into_words(&tokens);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].word, "Hello");
+        assert_eq!(words[1].word, "world");
+    }
+
+    #[test]
+    fn merge_tokens_into_words_returns_empty_for_no_tokens() {
+        assert!(merge_tokens_into_words(&[]).is_empty());
     }
 }
