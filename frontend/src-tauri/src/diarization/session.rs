@@ -67,7 +67,28 @@ impl DiarizationSession {
                 let window_duration = window.len() as f64 / expected_sample_rate as f64;
                 if window_duration >= WINDOW_SECONDS {
                     if let Some(start) = window_start_time {
-                        if let Err(e) = engine.process_chunk(&window, start) {
+                        // `process_chunk` runs real ONNX inference (segmentation +
+                        // embedding extraction) synchronously -- CPU-bound, no `.await`
+                        // points. Calling it directly here would block this tokio worker
+                        // thread for however long that inference takes, once per window,
+                        // for the whole call: on CPU-only hardware this starves the
+                        // runtime's scheduler over a multi-minute recording (observed as
+                        // live transcription/diarization silently falling behind and the
+                        // saved result only covering the first few minutes). The batch
+                        // path (import.rs/retranscription.rs) already avoids this via
+                        // spawn_blocking; mirror that here. Ownership of `engine` and
+                        // `window` is threaded through spawn_blocking and handed back so
+                        // the loop can keep reusing them across windows.
+                        let (result, returned_engine, returned_window) =
+                            tokio::task::spawn_blocking(move || {
+                                let result = engine.process_chunk(&window, start);
+                                (result, engine, window)
+                            })
+                            .await
+                            .expect("diarization process_chunk blocking task panicked");
+                        engine = returned_engine;
+                        window = returned_window;
+                        if let Err(e) = result {
                             log::warn!("Diarization: process_chunk failed on a window: {}", e);
                         }
                     }
@@ -79,13 +100,26 @@ impl DiarizationSession {
             // Flush the last partial window (recording ended mid-window).
             if !window.is_empty() {
                 if let Some(start) = window_start_time {
-                    if let Err(e) = engine.process_chunk(&window, start) {
+                    let (result, returned_engine, _window) =
+                        tokio::task::spawn_blocking(move || {
+                            let result = engine.process_chunk(&window, start);
+                            (result, engine, window)
+                        })
+                        .await
+                        .expect("diarization final process_chunk blocking task panicked");
+                    engine = returned_engine;
+                    if let Err(e) = result {
                         log::warn!("Diarization: final process_chunk failed: {}", e);
                     }
                 }
             }
 
-            engine.finalize()
+            // `finalize()` runs the final clustering pass -- not ONNX inference, but
+            // still synchronous CPU work over all accumulated embeddings; spawn_blocking
+            // for the same reason as process_chunk above.
+            tokio::task::spawn_blocking(move || engine.finalize())
+                .await
+                .expect("diarization finalize blocking task panicked")
         });
 
         Ok(Self { sender, task_handle })
