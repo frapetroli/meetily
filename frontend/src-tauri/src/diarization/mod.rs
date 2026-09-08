@@ -35,8 +35,8 @@ pub use clustering::cluster_embeddings;
 pub use commands::{diarization_download_models, diarization_get_status};
 pub use engine::{DiarizationEngine, DiarizationEngineError};
 pub use merge::{
-    assign_word_speakers, group_into_speaker_turns, SpeakerSegment, SpeakerTurn, WordTiming,
-    WordWithSpeaker,
+    assign_word_speakers, clean_speaker_turns, format_turns_as_text, group_into_speaker_turns,
+    SpeakerSegment, SpeakerTurn, WordTiming, WordWithSpeaker,
 };
 pub use model::{DiarizationModelStatus, DIARIZATION_MODEL_CATALOG};
 pub use session::DiarizationSession;

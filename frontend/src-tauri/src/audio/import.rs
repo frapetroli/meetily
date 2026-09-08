@@ -4,7 +4,7 @@ use crate::api::TranscriptSegment;
 use crate::audio::decoder::{decode_audio_file, decode_audio_file_with_progress};
 use crate::audio::vad::get_speech_chunks_with_progress;
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
-use crate::diarization::{assign_word_speakers, group_into_speaker_turns, DiarizationEngine, SpeakerSegment, WordTiming};
+use crate::diarization::{assign_word_speakers, clean_speaker_turns, group_into_speaker_turns, DiarizationEngine, SpeakerSegment, WordTiming};
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
@@ -679,7 +679,7 @@ async fn run_import<R: Runtime>(
                 word_timestamps_accumulator.len()
             );
             let words_with_speaker = assign_word_speakers(&word_timestamps_accumulator, &speaker_segments);
-            Some(group_into_speaker_turns(&words_with_speaker))
+            Some(clean_speaker_turns(group_into_speaker_turns(&words_with_speaker)))
         }
         None => None,
     };
@@ -722,6 +722,19 @@ async fn run_import<R: Runtime>(
 
     if let Err(e) = write_transcripts_json(&meeting_folder, &segments) {
         warn!("Failed to write transcripts.json: {}", e);
+    }
+
+    // Same speaker-labeled plain-text export as the live recording path (see
+    // recording_commands.rs::stop_recording's `diarizing` stage) and retranscription.rs --
+    // best-effort, only written when diarization actually produced turns.
+    if let Some(turns) = &diarized_turns {
+        if !turns.is_empty() {
+            let text = crate::diarization::format_turns_as_text(turns);
+            let path = meeting_folder.join("diarized_transcript.txt");
+            if let Err(e) = tokio::fs::write(&path, text).await {
+                warn!("Failed to write diarized_transcript.txt to {}: {}", path.display(), e);
+            }
+        }
     }
 
     if let Err(e) = write_import_metadata(

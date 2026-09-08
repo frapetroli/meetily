@@ -723,7 +723,9 @@ pub async fn stop_recording<R: Runtime>(
         );
 
         let words_with_speaker = crate::diarization::assign_word_speakers(&words, &segments);
-        let turns = crate::diarization::group_into_speaker_turns(&words_with_speaker);
+        let turns = crate::diarization::clean_speaker_turns(
+            crate::diarization::group_into_speaker_turns(&words_with_speaker),
+        );
         info!("🗣️ Merged into {} speaker turns", turns.len());
         Some(turns)
     } else {
@@ -1011,6 +1013,21 @@ pub async fn stop_recording<R: Runtime>(
     });
     if let Some(turns) = diarized_turns {
         if !turns.is_empty() {
+            // Save a plain-text, speaker-labeled copy of the final transcript alongside
+            // the audio in the recording folder -- separate from `transcripts.json`
+            // (written incrementally by `RecordingSaver` during the live call, before
+            // diarization completes, and never updated afterwards: see
+            // docs/sviluppi/diarization/Roadmap e todo.md in the docs workspace for why
+            // that file itself isn't updated here). Best-effort: a failure here shouldn't
+            // fail the whole stop sequence, the SQLite save via the frontend is still the
+            // canonical copy.
+            if let Some(folder) = &meeting_folder {
+                let text = crate::diarization::format_turns_as_text(&turns);
+                let path = folder.join("diarized_transcript.txt");
+                if let Err(e) = tokio::fs::write(&path, text).await {
+                    warn!("⚠️ Failed to write diarized_transcript.txt to {}: {}", path.display(), e);
+                }
+            }
             stopped_payload["diarized_turns"] = serde_json::json!(turns);
         }
     }
