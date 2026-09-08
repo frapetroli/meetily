@@ -33,6 +33,12 @@ pub async fn diarization_download_models<R: Runtime>(app: AppHandle<R>) -> Resul
         return Err("A diarization model download is already in progress".to_string());
     }
 
+    // Hold the same lock used around Whisper/Parakeet engine lifecycle (audio/common.rs)
+    // for the whole download: `download_models` writes straight to the final `.onnx`
+    // filenames (no temp file + rename), so a `DiarizationEngine::new()` call racing a
+    // download here could read a partially-written model file.
+    let _engine_lifecycle_guard = crate::audio::common::acquire_engine_lifecycle_lock().await;
+
     let result = download_inner(&app).await;
 
     DOWNLOAD_IN_PROGRESS.store(false, Ordering::SeqCst);

@@ -14,6 +14,13 @@ pub(crate) async fn acquire_engine_lifecycle_lock() -> OwnedMutexGuard<()> {
     ENGINE_LIFECYCLE_LOCK.clone().lock_owned().await
 }
 
+/// Same lock as `acquire_engine_lifecycle_lock`, for use from inside a `spawn_blocking`
+/// closure (e.g. `DiarizationEngine::new()` in the batch import/retranscription paths),
+/// where `.await` isn't available.
+pub(crate) fn acquire_engine_lifecycle_lock_blocking() -> OwnedMutexGuard<()> {
+    ENGINE_LIFECYCLE_LOCK.clone().blocking_lock_owned()
+}
+
 /// Unload the transcription engine after a batch job (import or retranscription).
 /// Skips unloading if a live recording is currently in progress, since recording
 /// uses the same global engine instances.

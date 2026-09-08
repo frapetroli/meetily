@@ -431,8 +431,14 @@ async fn run_import<R: Runtime>(
     let diarization_task = diarization_paths.map(|(segmentation_model_path, embedding_model_path)| {
         let audio_for_diarization = audio_samples.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<SpeakerSegment>> {
+            // Same lock used around Whisper/Parakeet engine lifecycle (audio/common.rs) and
+            // the diarization model download (diarization/commands.rs): model files are
+            // written in place (no temp + rename), so hold it while reading them here to
+            // avoid racing a concurrent re-download.
+            let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock_blocking();
             let mut engine = DiarizationEngine::new(&segmentation_model_path, &embedding_model_path, 1)
                 .map_err(|e| anyhow!("Failed to initialize diarization engine: {}", e))?;
+            drop(engine_lifecycle_guard);
             engine
                 .process_chunk(&audio_for_diarization, 0.0)
                 .map_err(|e| anyhow!("Diarization processing failed: {}", e))?;
