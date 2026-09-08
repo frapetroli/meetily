@@ -44,6 +44,10 @@ A privacy-first AI meeting assistant that captures, transcribes, and summarizes 
 
 ---
 
+> **This is a personal fork** of [Zackriya-Solutions/meetily](https://github.com/Zackriya-Solutions/meetily), maintained by [@frapetroli](https://github.com/frapetroli) to design and build a **local, CPU-only speaker diarization** feature on the `feature/diarization` branch — work in progress, not yet merged upstream. All original code remains under the MIT license below (see [LICENSE.md](LICENSE.md)); this fork's additions are released under the same terms. For the official, actively maintained Meetily, see the [upstream repository](https://github.com/Zackriya-Solutions/meetily).
+
+---
+
 > **Meetily PRO Upgrade Offer** - Meetily PRO is available for users who need enhanced accuracy, advanced exports, custom summary workflows, and team-ready features. Use coupon code **LAUNCH20** for **20% off** until the next Meetily Community Edition release. Speaker diarization is also planned for PRO in mid-June. [Explore Meetily PRO →](https://meetily.ai/pro/)
 
 ---
