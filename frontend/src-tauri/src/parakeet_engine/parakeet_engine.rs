@@ -1161,7 +1161,9 @@ mod tests {
         assert_eq!(words.len(), 1);
         assert_eq!(words[0].word, "Hello");
         assert_eq!(words[0].start, 0.0);
-        assert_eq!(words[0].end, 0.2);
+        // 0.2_f32 widened to f64 isn't bit-identical to the f64 literal 0.2 (binary
+        // rounding) -- compare against the same widening the function itself does.
+        assert_eq!(words[0].end, 0.2_f32 as f64);
     }
 
     #[test]
