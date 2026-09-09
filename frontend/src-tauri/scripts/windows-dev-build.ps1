@@ -54,7 +54,11 @@ $vsRoots = @(
     "C:\Program Files (x86)\Microsoft Visual Studio"
 )
 $msvcToolsetDirs = $vsRoots | Where-Object { Test-Path $_ } | ForEach-Object {
-    Get-ChildItem -Path $_ -Recurse -Depth 4 -Filter "cl.exe" -ErrorAction SilentlyContinue
+    # Real path is e.g. <root>\<version-or-year-folder>\<Edition>\VC\Tools\MSVC\<toolset>\bin\Hostx64\x64\cl.exe
+    # -- 9 directory levels below $_. -Depth 4 (the original value here) never reached it on
+    # any real install; bumped with margin so a differently-named version folder (e.g. "18")
+    # doesn't reopen the same bug.
+    Get-ChildItem -Path $_ -Recurse -Depth 10 -Filter "cl.exe" -ErrorAction SilentlyContinue
 } | Where-Object { $_.FullName -match "\\Hostx64\\x64\\cl\.exe$" }
 
 if (-not $msvcToolsetDirs) {
@@ -66,7 +70,9 @@ if (-not $msvcToolsetDirs) {
 
 # --- 2. Find a matching libclang.dll (bindgen needs this, not just cl.exe) ---
 $libclangCandidates = $vsRoots | Where-Object { Test-Path $_ } | ForEach-Object {
-    Get-ChildItem -Path $_ -Recurse -Depth 6 -Filter "libclang.dll" -ErrorAction SilentlyContinue
+    # <root>\<version-or-year-folder>\<Edition>\VC\Tools\Llvm\x64\bin\libclang.dll -- 7 levels
+    # below $_. -Depth 6 (the original value here) was one level short; same fix as cl.exe above.
+    Get-ChildItem -Path $_ -Recurse -Depth 10 -Filter "libclang.dll" -ErrorAction SilentlyContinue
 } | Where-Object { $_.FullName -match "\\x64\\bin\\libclang\.dll$" }
 
 if ($libclangCandidates) {
