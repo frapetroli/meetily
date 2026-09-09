@@ -18,7 +18,10 @@
 //! Final speaker identity is resolved once, across every chunk of the call, by
 //! `clustering::cluster_embeddings` (see `finalize()`).
 
-use crate::diarization::clustering::{cluster_embeddings, DEFAULT_CLUSTERING_THRESHOLD};
+use crate::diarization::clustering::{
+    cluster_embeddings, normalize_labels, reattach_small_clusters, DEFAULT_CLUSTERING_THRESHOLD,
+    MIN_CLUSTER_SIZE, REATTACH_THRESHOLD,
+};
 use crate::diarization::merge::SpeakerSegment;
 use sherpa_onnx::{
     OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
@@ -170,6 +173,13 @@ impl DiarizationEngine {
 
         let embeddings: Vec<Vec<f32>> = self.accumulated.iter().map(|(e, _, _)| e.clone()).collect();
         let labels = cluster_embeddings(&embeddings, DEFAULT_CLUSTERING_THRESHOLD);
+        // Real multi-speaker audio produces many tiny/singleton clusters out of the main
+        // pass (short backchannel interjections, cross-talk) -- see clustering.rs docs on
+        // REATTACH_THRESHOLD and docs/sviluppi/diarization/Architettura pipeline.md,
+        // "Validazione reale...". Fold them into an existing speaker where confident
+        // enough, then compact the resulting label ids back to a contiguous range.
+        let labels = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD);
+        let labels = normalize_labels(&labels);
 
         let mut segments: Vec<SpeakerSegment> = self
             .accumulated

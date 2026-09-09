@@ -100,6 +100,115 @@ pub fn distinct_speaker_count(labels: &[usize]) -> usize {
         .len()
 }
 
+/// Clusters smaller than this (after `cluster_embeddings`) are treated as unreliable --
+/// likely a noisy/short segment that failed to reach `DEFAULT_CLUSTERING_THRESHOLD`
+/// against its true speaker, rather than a genuine extra participant -- and become
+/// candidates for `reattach_small_clusters`.
+pub const MIN_CLUSTER_SIZE: usize = 2;
+
+/// Secondary, more permissive threshold used only by `reattach_small_clusters`, never by
+/// the main `cluster_embeddings` pass. See `docs/sviluppi/diarization/Architettura
+/// pipeline.md`, section "Validazione reale: sovra-segmentazione su conversazione
+/// italiana naturale a 4 speaker" (settembre 2026): a real 4-speaker Italian meeting,
+/// full of short backchannel interjections ("sì"/"ok"/"esatto") and overlapping speech,
+/// produced 44-48 distinct speaker labels at `DEFAULT_CLUSTERING_THRESHOLD` alone --
+/// almost all of them singleton clusters, because short/noisy embeddings often land just
+/// short of 0.6 similarity to the speaker they actually belong to.
+///
+/// Deliberately lower than `DEFAULT_CLUSTERING_THRESHOLD` (0.6) and applied only to
+/// clusters smaller than `MIN_CLUSTER_SIZE` -- this keeps the strict threshold protecting
+/// genuinely distinct speakers during the main pass, while giving noisy tiny clusters a
+/// second, more permissive chance to reattach to an existing speaker instead of minting a
+/// new one. **Starting point, not yet recalibrated against real data**: the project's
+/// clustering calibration set (`docs/sviluppi/diarization/Roadmap e todo.md`, "Blocker
+/// 2") has no sample with more than 2 speakers or real cross-talk -- this value should be
+/// revisited once one exists.
+pub const REATTACH_THRESHOLD: f32 = 0.45;
+
+/// Second pass over `cluster_embeddings`'s output: folds clusters smaller than
+/// `min_cluster_size` into the nearest larger cluster, if their average cosine similarity
+/// to it clears `reattach_threshold`. Otherwise a small cluster is left exactly as-is --
+/// a genuinely ambiguous or distinct short segment still ends up as its own cluster,
+/// same as before this pass existed.
+///
+/// Runs a single pass over the small clusters (does not re-check newly grown clusters
+/// against each other, and never merges two small clusters together) -- sufficient for
+/// the observed failure mode (many independent singletons scattered around a couple of
+/// real speakers), and avoids the risk of chaining unrelated tiny clusters into one.
+///
+/// If every cluster is "small" (no cluster reaches `min_cluster_size`), there is nothing
+/// reliable to reattach to, so the input is returned unchanged.
+pub fn reattach_small_clusters(
+    embeddings: &[Vec<f32>],
+    labels: &[usize],
+    min_cluster_size: usize,
+    reattach_threshold: f32,
+) -> Vec<usize> {
+    if embeddings.is_empty() {
+        return Vec::new();
+    }
+
+    let mut members_by_label: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (idx, &label) in labels.iter().enumerate() {
+        members_by_label.entry(label).or_default().push(idx);
+    }
+
+    let (small, large): (Vec<_>, Vec<_>) = members_by_label
+        .into_iter()
+        .partition(|(_, members)| members.len() < min_cluster_size);
+
+    if large.is_empty() {
+        return labels.to_vec();
+    }
+
+    let mut new_labels = labels.to_vec();
+    for (_, small_members) in &small {
+        let mut best: Option<(usize, f32)> = None;
+        for (large_label, large_members) in &large {
+            let mut sum = 0.0f32;
+            let mut count = 0usize;
+            for &a in small_members {
+                for &b in large_members {
+                    sum += cosine_similarity(&embeddings[a], &embeddings[b]);
+                    count += 1;
+                }
+            }
+            let avg = sum / count as f32;
+            if best.map_or(true, |(_, best_sim)| avg > best_sim) {
+                best = Some((*large_label, avg));
+            }
+        }
+        if let Some((target_label, sim)) = best {
+            if sim >= reattach_threshold {
+                for &member in small_members {
+                    new_labels[member] = target_label;
+                }
+            }
+        }
+    }
+
+    new_labels
+}
+
+/// Remaps arbitrary label ids (e.g. left non-contiguous by `reattach_small_clusters`
+/// folding some labels away entirely) to a contiguous 0-indexed range, preserving
+/// first-seen order. Cosmetic only: never changes which inputs share a label.
+pub fn normalize_labels(labels: &[usize]) -> Vec<usize> {
+    let mut next_id = 0usize;
+    let mut remap: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    labels
+        .iter()
+        .map(|&label| {
+            *remap.entry(label).or_insert_with(|| {
+                let id = next_id;
+                next_id += 1;
+                id
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +283,75 @@ mod tests {
         let zero = vec![0.0, 0.0, 0.0];
         let v = vec![1.0, 2.0, 3.0];
         assert_eq!(cosine_similarity(&zero, &v), 0.0);
+    }
+
+    #[test]
+    fn singleton_reattaches_to_the_nearest_real_cluster() {
+        // s is unit-length by construction (0.5^2 + 0.15^2 + 0.853^2 ~= 1), so its cosine
+        // similarity to c0=[1,0,0] is exactly 0.5 and to c1=[0,1,0] exactly 0.15 -- below
+        // DEFAULT_CLUSTERING_THRESHOLD (0.6) to both, so the main pass leaves it a
+        // singleton, but above REATTACH_THRESHOLD (0.45) to c0 only.
+        let c0 = vec![1.0, 0.0, 0.0];
+        let c1 = vec![0.0, 1.0, 0.0];
+        let s = vec![0.5, 0.15, 0.853];
+        let embeddings = vec![c0.clone(), c0.clone(), c0, c1.clone(), c1, s];
+
+        let labels = cluster_embeddings(&embeddings, DEFAULT_CLUSTERING_THRESHOLD);
+        assert_eq!(distinct_speaker_count(&labels), 3, "singleton must not auto-merge under the main threshold");
+        let singleton_label = labels[5];
+        assert_ne!(singleton_label, labels[0]);
+        assert_ne!(singleton_label, labels[3]);
+
+        let reattached = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD);
+        assert_eq!(distinct_speaker_count(&reattached), 2, "singleton should fold into cluster 0");
+        assert_eq!(reattached[5], reattached[0]);
+        assert_ne!(reattached[5], reattached[3]);
+    }
+
+    #[test]
+    fn singleton_too_far_from_everything_stays_its_own_cluster() {
+        // Same construction as above, but similarity to both real clusters (0.3 and 0.2)
+        // is below REATTACH_THRESHOLD (0.45) -- forcing a merge here would be exactly the
+        // "silently attach to the nearest cluster regardless of confidence" behavior the
+        // ambiguous-segment test above already guards against for the main pass.
+        let c0 = vec![1.0, 0.0, 0.0];
+        let c1 = vec![0.0, 1.0, 0.0];
+        let s = vec![0.3, 0.2, 0.9327];
+        let embeddings = vec![c0.clone(), c0.clone(), c0, c1.clone(), c1, s];
+
+        let labels = cluster_embeddings(&embeddings, DEFAULT_CLUSTERING_THRESHOLD);
+        let reattached = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD);
+        assert_eq!(distinct_speaker_count(&reattached), 3, "below-threshold singleton must remain isolated");
+        assert_ne!(reattached[5], reattached[0]);
+        assert_ne!(reattached[5], reattached[3]);
+    }
+
+    #[test]
+    fn no_large_cluster_to_reattach_to_leaves_labels_unchanged() {
+        // Three mutually distant embeddings: cluster_embeddings gives each its own label,
+        // and every resulting cluster is "small" (size 1 < MIN_CLUSTER_SIZE) -- there is
+        // nothing reliable to fold into, so the pass must be a no-op.
+        let embeddings = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]];
+        let labels = cluster_embeddings(&embeddings, DEFAULT_CLUSTERING_THRESHOLD);
+        assert_eq!(distinct_speaker_count(&labels), 3);
+
+        let reattached = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD);
+        assert_eq!(reattached, labels);
+    }
+
+    #[test]
+    fn no_small_clusters_present_leaves_labels_unchanged() {
+        let dim = 8;
+        let embeddings = vec![unit(0, dim), unit(0, dim), unit(1, dim), unit(1, dim)];
+        let labels = cluster_embeddings(&embeddings, DEFAULT_CLUSTERING_THRESHOLD);
+        let reattached = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD);
+        assert_eq!(reattached, labels);
+    }
+
+    #[test]
+    fn normalize_labels_remaps_to_contiguous_ids_preserving_first_seen_order() {
+        assert_eq!(normalize_labels(&[5, 5, 2, 2, 9]), vec![0, 0, 1, 1, 2]);
+        assert_eq!(normalize_labels(&[]), Vec::<usize>::new());
+        assert_eq!(normalize_labels(&[0, 0, 0]), vec![0, 0, 0]);
     }
 }
