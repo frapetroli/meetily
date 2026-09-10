@@ -106,24 +106,27 @@ pub fn distinct_speaker_count(labels: &[usize]) -> usize {
 /// candidates for `reattach_small_clusters`.
 pub const MIN_CLUSTER_SIZE: usize = 2;
 
-/// Secondary, more permissive threshold used only by `reattach_small_clusters`, never by
-/// the main `cluster_embeddings` pass. See `docs/sviluppi/diarization/Architettura
-/// pipeline.md`, section "Validazione reale: sovra-segmentazione su conversazione
-/// italiana naturale a 4 speaker" (settembre 2026): a real 4-speaker Italian meeting,
-/// full of short backchannel interjections ("sì"/"ok"/"esatto") and overlapping speech,
-/// produced 44-48 distinct speaker labels at `DEFAULT_CLUSTERING_THRESHOLD` alone --
-/// almost all of them singleton clusters, because short/noisy embeddings often land just
-/// short of 0.6 similarity to the speaker they actually belong to.
+/// Secondary threshold used only by `reattach_small_clusters`, never by the main
+/// `cluster_embeddings` pass -- applied only to clusters smaller than `MIN_CLUSTER_SIZE`,
+/// giving noisy tiny clusters (short backchannel interjections, cross-talk) a second
+/// chance to reattach to an existing speaker instead of minting a new one. See
+/// `docs/sviluppi/diarization/Architettura pipeline.md`, section "Validazione reale...".
 ///
-/// Deliberately lower than `DEFAULT_CLUSTERING_THRESHOLD` (0.6) and applied only to
-/// clusters smaller than `MIN_CLUSTER_SIZE` -- this keeps the strict threshold protecting
-/// genuinely distinct speakers during the main pass, while giving noisy tiny clusters a
-/// second, more permissive chance to reattach to an existing speaker instead of minting a
-/// new one. **Starting point, not yet recalibrated against real data**: the project's
-/// clustering calibration set (`docs/sviluppi/diarization/Roadmap e todo.md`, "Blocker
-/// 2") has no sample with more than 2 speakers or real cross-talk -- this value should be
-/// revisited once one exists.
-pub const REATTACH_THRESHOLD: f32 = 0.45;
+/// **Calibrated against real data, not a guess**: see `docs/adr/0022-reattach-threshold-
+/// ricalibrato-0.60-dati-reali.md`. A grid sweep (`examples/diarization_calibration.rs`)
+/// against 5 real multi-speaker recordings with reference transcripts showed per-turn
+/// accuracy climbing as this threshold rises from 0.45 up to `DEFAULT_CLUSTERING_THRESHOLD`
+/// (0.6), then plateauing exactly there -- pushing higher only inflated the spurious
+/// speaker count further with no further accuracy gain (sometimes literally zero, e.g.
+/// stuck at 90.6% from 0.60 through 0.70 on one real recording). Intentionally set equal
+/// to `DEFAULT_CLUSTERING_THRESHOLD` rather than lower, contrary to this constant's
+/// original (unvalidated) design intent of being "more permissive" -- the data didn't
+/// support that. **Honest caveat**: even at this calibrated value, detected speaker counts
+/// on real recordings stay far above ground truth (e.g. 55 vs 4, 389 vs 8) -- this
+/// threshold alone does not solve the underlying over-segmentation, it only measurably
+/// improves it. The remaining gap likely comes from embedding quality on short/noisy real
+/// segments, not from this threshold -- separate future work, not yet investigated.
+pub const REATTACH_THRESHOLD: f32 = 0.60;
 
 /// Second pass over `cluster_embeddings`'s output: folds clusters smaller than
 /// `min_cluster_size` into the nearest larger cluster, if their average cosine similarity
@@ -290,7 +293,13 @@ mod tests {
         // s is unit-length by construction (0.5^2 + 0.15^2 + 0.853^2 ~= 1), so its cosine
         // similarity to c0=[1,0,0] is exactly 0.5 and to c1=[0,1,0] exactly 0.15 -- below
         // DEFAULT_CLUSTERING_THRESHOLD (0.6) to both, so the main pass leaves it a
-        // singleton, but above REATTACH_THRESHOLD (0.45) to c0 only.
+        // singleton, but above the reattach threshold used in this test (0.45) to c0 only.
+        // Deliberately a literal here, not the live `REATTACH_THRESHOLD` constant -- these
+        // tests exercise `reattach_small_clusters`'s logic at a fixed, hand-verified
+        // boundary, independent of whatever the constant is calibrated to today (see
+        // docs/adr/0022-reattach-threshold-ricalibrato-0.60-dati-reali.md), same style as
+        // `ambiguous_segment_does_not_force_a_merge_below_threshold` above already uses a
+        // literal 0.85 instead of `DEFAULT_CLUSTERING_THRESHOLD`.
         let c0 = vec![1.0, 0.0, 0.0];
         let c1 = vec![0.0, 1.0, 0.0];
         let s = vec![0.5, 0.15, 0.853];
@@ -302,7 +311,7 @@ mod tests {
         assert_ne!(singleton_label, labels[0]);
         assert_ne!(singleton_label, labels[3]);
 
-        let reattached = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD);
+        let reattached = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, 0.45);
         assert_eq!(distinct_speaker_count(&reattached), 2, "singleton should fold into cluster 0");
         assert_eq!(reattached[5], reattached[0]);
         assert_ne!(reattached[5], reattached[3]);
@@ -311,16 +320,17 @@ mod tests {
     #[test]
     fn singleton_too_far_from_everything_stays_its_own_cluster() {
         // Same construction as above, but similarity to both real clusters (0.3 and 0.2)
-        // is below REATTACH_THRESHOLD (0.45) -- forcing a merge here would be exactly the
-        // "silently attach to the nearest cluster regardless of confidence" behavior the
-        // ambiguous-segment test above already guards against for the main pass.
+        // is below the 0.45 reattach threshold used here -- forcing a merge here would be
+        // exactly the "silently attach to the nearest cluster regardless of confidence"
+        // behavior the ambiguous-segment test above already guards against for the main
+        // pass. See the literal-vs-constant note in the test above.
         let c0 = vec![1.0, 0.0, 0.0];
         let c1 = vec![0.0, 1.0, 0.0];
         let s = vec![0.3, 0.2, 0.9327];
         let embeddings = vec![c0.clone(), c0.clone(), c0, c1.clone(), c1, s];
 
         let labels = cluster_embeddings(&embeddings, DEFAULT_CLUSTERING_THRESHOLD);
-        let reattached = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD);
+        let reattached = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, 0.45);
         assert_eq!(distinct_speaker_count(&reattached), 3, "below-threshold singleton must remain isolated");
         assert_ne!(reattached[5], reattached[0]);
         assert_ne!(reattached[5], reattached[3]);
@@ -330,12 +340,12 @@ mod tests {
     fn no_large_cluster_to_reattach_to_leaves_labels_unchanged() {
         // Three mutually distant embeddings: cluster_embeddings gives each its own label,
         // and every resulting cluster is "small" (size 1 < MIN_CLUSTER_SIZE) -- there is
-        // nothing reliable to fold into, so the pass must be a no-op.
+        // nothing reliable to fold into, so the pass must be a no-op regardless of threshold.
         let embeddings = vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]];
         let labels = cluster_embeddings(&embeddings, DEFAULT_CLUSTERING_THRESHOLD);
         assert_eq!(distinct_speaker_count(&labels), 3);
 
-        let reattached = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD);
+        let reattached = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, 0.45);
         assert_eq!(reattached, labels);
     }
 
@@ -344,7 +354,7 @@ mod tests {
         let dim = 8;
         let embeddings = vec![unit(0, dim), unit(0, dim), unit(1, dim), unit(1, dim)];
         let labels = cluster_embeddings(&embeddings, DEFAULT_CLUSTERING_THRESHOLD);
-        let reattached = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD);
+        let reattached = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, 0.45);
         assert_eq!(reattached, labels);
     }
 
