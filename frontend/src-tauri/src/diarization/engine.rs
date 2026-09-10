@@ -162,36 +162,56 @@ impl DiarizationEngine {
         Ok(())
     }
 
-    /// Cluster everything accumulated across the whole call/import job (one-shot, at
-    /// end-of-stream -- ADR-0004/ADR-0009's `diarizing` stage), and return the resulting
-    /// speaker-labeled segments sorted by start time. Consumes `self`: a
-    /// `DiarizationEngine` is single-use per recording.
-    pub fn finalize(self) -> Vec<SpeakerSegment> {
+    /// Same clustering/merge logic as `finalize()`, but takes `&self` (doesn't consume)
+    /// and lets the caller override the three threshold constants instead of always using
+    /// the project's calibrated defaults. Exists so a calibration sweep (see
+    /// `examples/diarization_calibration.rs`) can re-run just the cheap clustering step
+    /// against many threshold combinations without re-running the expensive ONNX
+    /// segmentation/embedding inference in `process_chunk` for every grid point -- that
+    /// inference already happened once, its output is what's sitting in `self.accumulated`.
+    pub fn finalize_with_thresholds(
+        &self,
+        clustering_threshold: f32,
+        min_cluster_size: usize,
+        reattach_threshold: f32,
+    ) -> Vec<SpeakerSegment> {
         if self.accumulated.is_empty() {
             return Vec::new();
         }
 
         let embeddings: Vec<Vec<f32>> = self.accumulated.iter().map(|(e, _, _)| e.clone()).collect();
-        let labels = cluster_embeddings(&embeddings, DEFAULT_CLUSTERING_THRESHOLD);
+        let labels = cluster_embeddings(&embeddings, clustering_threshold);
         // Real multi-speaker audio produces many tiny/singleton clusters out of the main
         // pass (short backchannel interjections, cross-talk) -- see clustering.rs docs on
         // REATTACH_THRESHOLD and docs/sviluppi/diarization/Architettura pipeline.md,
         // "Validazione reale...". Fold them into an existing speaker where confident
         // enough, then compact the resulting label ids back to a contiguous range.
-        let labels = reattach_small_clusters(&embeddings, &labels, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD);
+        let labels = reattach_small_clusters(&embeddings, &labels, min_cluster_size, reattach_threshold);
         let labels = normalize_labels(&labels);
 
         let mut segments: Vec<SpeakerSegment> = self
             .accumulated
-            .into_iter()
+            .iter()
             .zip(labels)
             .map(|((_, start, end), label)| SpeakerSegment {
-                start,
-                end,
+                start: *start,
+                end: *end,
                 speaker: format!("speaker_{label}"),
             })
             .collect();
         segments.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
         segments
+    }
+
+    /// Cluster everything accumulated across the whole call/import job (one-shot, at
+    /// end-of-stream -- ADR-0004/ADR-0009's `diarizing` stage), and return the resulting
+    /// speaker-labeled segments sorted by start time. Consumes `self`: a
+    /// `DiarizationEngine` is single-use per recording.
+    ///
+    /// Thin wrapper over `finalize_with_thresholds` using the project's calibrated
+    /// defaults -- production call sites (session.rs/import.rs/retranscription.rs) are
+    /// unaffected by its existence.
+    pub fn finalize(self) -> Vec<SpeakerSegment> {
+        self.finalize_with_thresholds(DEFAULT_CLUSTERING_THRESHOLD, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD)
     }
 }
