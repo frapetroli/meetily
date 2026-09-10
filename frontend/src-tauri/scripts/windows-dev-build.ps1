@@ -83,7 +83,34 @@ if ($libclangCandidates) {
     Write-Warning "No libclang.dll found under a Visual Studio install (VC\Tools\Llvm\x64\bin). Add the 'C++ Clang Compiler for Windows' individual component in Visual Studio Installer, or bindgen will fall back to a possibly-incompatible libclang found elsewhere on PATH."
 }
 
-# --- 3. Prefer Ninja for CMake if available, to avoid cmake's own VS-instance-detection bugs ---
+# --- 3. Import INCLUDE/LIB from vcvarsall.bat (bindgen needs these to find stdbool.h and
+#        the other C standard headers -- LIBCLANG_PATH alone only tells it which clang to
+#        load, not where to look for headers; found the hard way: "libclang.dll" loads fine
+#        but bindgen still fails with "'stdbool.h' file not found" without this). ---
+if ($msvcToolsetDirs) {
+    $vsInstallRoot = ($msvcToolsetDirs | Select-Object -First 1).FullName -replace '\\VC\\Tools\\MSVC\\.*$', ''
+    $vcvarsall = Join-Path $vsInstallRoot "VC\Auxiliary\Build\vcvarsall.bat"
+    if (Test-Path $vcvarsall) {
+        Write-Host "Importing INCLUDE/LIB from $vcvarsall (x64)..." -ForegroundColor Cyan
+        $envLines = cmd /c "`"$vcvarsall`" x64 >nul 2>&1 && set"
+        $imported = 0
+        foreach ($line in $envLines) {
+            if ($line -match '^(INCLUDE|LIB|LIBPATH)=(.*)$') {
+                Set-Item -Path "Env:$($matches[1])" -Value $matches[2]
+                $imported++
+            }
+        }
+        if ($imported -gt 0) {
+            Write-Host "Imported $imported environment variable(s) (INCLUDE/LIB/LIBPATH)." -ForegroundColor Green
+        } else {
+            Write-Warning "vcvarsall.bat ran but no INCLUDE/LIB/LIBPATH came back -- bindgen will likely still fail to find stdbool.h."
+        }
+    } else {
+        Write-Warning "vcvarsall.bat not found at $vcvarsall -- INCLUDE/LIB not set, bindgen may fail to find standard C headers (stdbool.h etc). Run this script from a 'Developer PowerShell for VS' instead, or set INCLUDE/LIB manually."
+    }
+}
+
+# --- 4. Prefer Ninja for CMake if available, to avoid cmake's own VS-instance-detection bugs ---
 $ninja = Get-Command ninja.exe -ErrorAction SilentlyContinue
 if ($ninja) {
     $env:CMAKE_GENERATOR = "Ninja"
@@ -92,12 +119,12 @@ if ($ninja) {
     Write-Warning "ninja.exe not found on PATH -- letting CMake auto-detect a generator. If the build fails with 'could not find any instance of Visual Studio' for a generator like 'Visual Studio NN 20XX', install Ninja (winget install Ninja-build.Ninja) and re-run this script."
 }
 
-# --- 4. Warn about OneDrive-synced repo paths (observed to cause stale/locked build-cache dirs) ---
+# --- 5. Warn about OneDrive-synced repo paths (observed to cause stale/locked build-cache dirs) ---
 if ($RepoRoot -match "OneDrive") {
     Write-Warning "Repo path is under a OneDrive-synced folder ($RepoRoot). This caused spurious build-cache locks (cargo clean failing mid-cleanup, stale linked artifacts) on the machine this was first debugged on. Consider setting CARGO_TARGET_DIR to a path outside OneDrive, e.g.:`n  `$env:CARGO_TARGET_DIR = 'C:\meetily-build-target'"
 }
 
-# --- 5. Run cargo ---
+# --- 6. Run cargo ---
 Write-Host "`nRunning: cargo $CargoCommand (in $CrateDir)" -ForegroundColor Cyan
 Push-Location $CrateDir
 try {
