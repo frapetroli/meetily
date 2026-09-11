@@ -54,6 +54,13 @@ struct Cli {
     /// Comma-separated list of REATTACH_THRESHOLD values to try.
     #[arg(long, default_value = "0.35,0.40,0.45,0.50")]
     reattach_thresholds: String,
+
+    /// Upper bound passed to the experimental spectral-clustering method
+    /// (`DiarizationEngine::finalize_with_spectral`). Pass a generous value, not a tight
+    /// guess at the real speaker count -- see `cluster_embeddings_spectral`'s doc comment
+    /// on why capping too tightly can collapse the estimate well below the cap.
+    #[arg(long, default_value_t = 20)]
+    max_speakers: usize,
 }
 
 struct GroundTruthTurn {
@@ -325,6 +332,7 @@ fn main() -> Result<()> {
     println!("Found {} recording(s) to calibrate against.\n", recordings.len());
 
     let mut all_results: Vec<(String, GridResult)> = Vec::new();
+    let mut spectral_results: Vec<(String, usize, usize, f64)> = Vec::new(); // (name, detected, true, accuracy)
 
     for recording in &recordings {
         println!("=== {} ===", recording.name);
@@ -377,6 +385,19 @@ fn main() -> Result<()> {
                 ));
             }
         }
+
+        // Experimental spectral method -- same already-accumulated embeddings, no second
+        // ONNX inference pass. Printed separately since it isn't part of the
+        // threshold/reattach grid (it has its own single parameter, max_speakers).
+        let spectral_segments = engine.finalize_with_spectral(cli.max_speakers);
+        let spectral_detected = distinct_speaker_count(&spectral_segments);
+        let spectral_accuracy = score_against_ground_truth(&spectral_segments, &ground_truth);
+        println!(
+            "  spectral (max_speakers={}) | detected {:>3} | true {:>3} | turn acc {:>5.1}%",
+            cli.max_speakers, spectral_detected, true_speaker_count, spectral_accuracy
+        );
+        spectral_results.push((recording.name.clone(), spectral_detected, true_speaker_count, spectral_accuracy));
+
         println!();
     }
 
@@ -405,6 +426,28 @@ fn main() -> Result<()> {
             );
         }
     }
+
+    println!(
+        "\n=== Spettrale (max_speakers={}), media su {} registrazioni ===",
+        cli.max_speakers,
+        recordings.len()
+    );
+    println!("  {:>30} | {:>9} | {:>9} | {:>12}", "registrazione", "detected", "true", "turn acc %");
+    for (name, detected, truth, accuracy) in &spectral_results {
+        println!("  {:>30} | {:>9} | {:>9} | {:>12.1}", name, detected, truth, accuracy);
+    }
+    let n_spectral = spectral_results.len() as f64;
+    let spectral_avg_count_error: f64 = spectral_results
+        .iter()
+        .map(|(_, d, t, _)| (*d as f64 - *t as f64).abs())
+        .sum::<f64>()
+        / n_spectral;
+    let spectral_avg_accuracy: f64 =
+        spectral_results.iter().map(|(_, _, _, a)| a).sum::<f64>() / n_spectral;
+    println!(
+        "  {:>30} | avg |detected-true| {:>6.2} | avg turn acc {:>5.1}%",
+        "AGGREGATO", spectral_avg_count_error, spectral_avg_accuracy
+    );
 
     Ok(())
 }

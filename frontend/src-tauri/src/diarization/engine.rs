@@ -19,8 +19,8 @@
 //! `clustering::cluster_embeddings` (see `finalize()`).
 
 use crate::diarization::clustering::{
-    cluster_embeddings, normalize_labels, reattach_small_clusters, DEFAULT_CLUSTERING_THRESHOLD,
-    MIN_CLUSTER_SIZE, REATTACH_THRESHOLD,
+    cluster_embeddings, cluster_embeddings_spectral, normalize_labels, reattach_small_clusters,
+    DEFAULT_CLUSTERING_THRESHOLD, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD,
 };
 use crate::diarization::merge::SpeakerSegment;
 use sherpa_onnx::{
@@ -213,5 +213,40 @@ impl DiarizationEngine {
     /// unaffected by its existence.
     pub fn finalize(self) -> Vec<SpeakerSegment> {
         self.finalize_with_thresholds(DEFAULT_CLUSTERING_THRESHOLD, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD)
+    }
+
+    /// Experimental alternative to `finalize`/`finalize_with_thresholds`: clusters the
+    /// same accumulated embeddings with `clustering::cluster_embeddings_spectral`
+    /// (automatic speaker-count estimation via the eigengap heuristic) instead of the
+    /// fixed-threshold agglomerative approach. Not called by any production code path
+    /// (session.rs/import.rs/retranscription.rs) -- exists only for
+    /// `examples/diarization_calibration.rs` to A/B test against `finalize_with_thresholds`
+    /// on real recordings before any decision to use this in production. See
+    /// docs/sviluppi/diarization/Architettura pipeline.md for the rationale.
+    ///
+    /// No `reattach_small_clusters` pass here: the spectral method already bounds the
+    /// cluster count via `max_speakers`, unlike the threshold method's cluster count,
+    /// which the reattach pass exists to rein in.
+    pub fn finalize_with_spectral(&self, max_speakers: usize) -> Vec<SpeakerSegment> {
+        if self.accumulated.is_empty() {
+            return Vec::new();
+        }
+
+        let embeddings: Vec<Vec<f32>> = self.accumulated.iter().map(|(e, _, _)| e.clone()).collect();
+        let labels = cluster_embeddings_spectral(&embeddings, max_speakers);
+        let labels = normalize_labels(&labels);
+
+        let mut segments: Vec<SpeakerSegment> = self
+            .accumulated
+            .iter()
+            .zip(labels)
+            .map(|((_, start, end), label)| SpeakerSegment {
+                start: *start,
+                end: *end,
+                speaker: format!("speaker_{label}"),
+            })
+            .collect();
+        segments.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
+        segments
     }
 }
