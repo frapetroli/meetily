@@ -219,77 +219,268 @@ pub fn normalize_labels(labels: &[usize]) -> Vec<usize> {
 // Spectral clustering (experimental alternative to `cluster_embeddings`)
 // ============================================================================
 //
-// NME-SC family (eigengap heuristic on a pruned, normalized-Laplacian cosine affinity
-// graph -- Park et al. 2019 "Auto-Tuning Spectral Clustering for Speaker Diarization
-// Using Normalized Maximum Eigengap"; von Luxburg 2007 "A Tutorial on Spectral
-// Clustering"; Ng-Jordan-Weiss 2002 for the normalized-Laplacian + row-normalized-
-// eigenvector formulation). Estimates the number of speakers automatically instead of
-// requiring a fixed similarity threshold -- see docs/sviluppi/diarization/Architettura
-// pipeline.md ("Prima calibrazione reale...") for why `cluster_embeddings`'s threshold
-// approach, even recalibrated (ADR-0022), still leaves real recordings wildly
-// over-segmented (e.g. 55 detected vs 4 true speakers). Experimental: not wired into
-// `DiarizationEngine::finalize()` (production) yet -- only into
-// `finalize_with_spectral()`, used by `examples/diarization_calibration.rs` to A/B test
-// against the threshold approach on real recordings before any production decision.
+// NME-SC (Normalized Maximum Eigengap Spectral Clustering) -- Park, Han, Kumar,
+// Narayanan, "Auto-Tuning Spectral Clustering for Speaker Diarization Using Normalized
+// Maximum Eigengap", IEEE Signal Processing Letters 2019 (arXiv:2003.02405), later
+// adopted into NVIDIA NeMo's diarization pipeline. This is a faithful translation of the
+// authors' own reference implementation (github.com/tango4j/Auto-Tuning-Spectral-
+// Clustering, spectral_opt.py -- `NMEanalysis`/`estimate_num_of_spkrs`/
+// `get_kneighbors_conn`/`get_X_conn_from_dist`/`getLaplacian`/`getLamdaGaplist`, fetched
+// and verified against that source in September 2026), not an independent design -- see
+// docs/sviluppi/diarization/Architettura pipeline.md ("Tentativo di fix: p fisso...") for
+// why a single p value (however chosen) proved unable to generalize across recordings of
+// very different size and noise characteristics, which is exactly the problem this
+// per-recording auto-search exists to solve. Estimates the number of speakers
+// automatically instead of requiring a fixed similarity threshold -- see "Prima
+// calibrazione reale..." for why `cluster_embeddings`'s threshold approach, even
+// recalibrated (ADR-0022), still leaves real recordings wildly over-segmented.
+// Experimental: not wired into `DiarizationEngine::finalize()` (production) yet -- only
+// into `finalize_with_spectral()`, used by `examples/diarization_calibration.rs` to A/B
+// test against the threshold approach on real recordings before any production decision.
 //
-// This implements the *core* technique, not the full NME auto-search over the
-// neighbor-pruning parameter `p` (Park et al.'s "Normalized Maximum Eigengap" search
-// tries many candidate `p` values and picks the one maximizing a normalized eigengap
-// score) -- a single defensible formula for `p` is used instead (see
-// `nearest_neighbor_count`). Flagged as a documented possible future refinement, not
-// blocking for this first experiment.
+// Key differences from this file's first (non-reference) attempt at this technique,
+// corrected after reading the real reference source instead of re-deriving the method
+// from theory alone:
+// - The k-NN graph is a BINARY connectivity graph (0/1, then 0/0.5/1 after averaging
+//   symmetrization), not a graph weighted by the actual cosine similarity values.
+// - The Laplacian is the *unnormalized* `L = D - A`, not the symmetric normalized
+//   `I - D^-1/2 A D^-1/2` used before -- comparability across recordings of different
+//   sizes comes instead from normalizing the *eigengap* by the largest eigenvalue when
+//   scoring candidate `p` values (see `nme_select_p`), not from normalizing the
+//   Laplacian itself.
+// - `p` is not one fixed formula: many candidate values are tried per recording (up to
+//   `MAX_RP_THRESHOLD` of the segment count, matching the reference's own default) and
+//   the one minimizing a specific ratio -- (fraction of segments connected) / (how
+//   confident the resulting eigengap is) -- is kept. This is the actual "auto-tuning"
+//   the NME name refers to; the first attempt's `ln(n)+1` formula was a simplification
+//   that a real calibration run (see the doc referenced above) showed does not
+//   generalize: a single p that works for a small recording actively hurts a large one
+//   and vice versa.
+// - No row-normalization of the eigenvectors before k-means (the reference hardcodes
+//   `norm_laplacian=False`) -- the first attempt added a Ng-Jordan-Weiss
+//   row-normalization step the reference does not use; removed for fidelity.
+//
+// Deliberate, documented deviation kept from the first attempt: k-means (see `kmeans`
+// below) uses a deterministic "farthest-first" initialization and a single run, not
+// scikit-learn's `KMeans(n_init=10)` (10 random restarts) that the reference uses --
+// determinism was worth more than matching this specific detail, given there is no
+// compiler available in the sandbox this was written in to catch a randomness-related
+// bug before it reaches a real machine.
+//
+// Honest testing caveat (see the test module): the exact hand-derived eigenvalues used
+// to verify this file's first attempt do not transfer cleanly to this version. Two real
+// quirks of the reference algorithm interact badly with the perfectly-orthogonal,
+// exactly-zero-cross-similarity test vectors used before: (1) the diagonal (self-
+// similarity, always the maximum possible value) is only zeroed out *after* neighbor
+// selection, so one neighbor "slot" per node is always spent on itself -- faithfully
+// reproduced here, see `build_knn_connectivity`'s doc comment; (2) the connectivity
+// fallback below actively fights exactly-zero cross-cluster similarity (it keeps raising
+// `p` until the *whole* graph is one connected component, which an exactly
+// block-diagonal similarity matrix resists by construction). Real embeddings never have
+// exactly zero cross-speaker similarity, so this is a test-construction artifact, not a
+// real-world concern -- but it does mean the tests below verify sub-components and
+// qualitative/structural outcomes on realistic (non-adversarial) inputs, rather than
+// exact end-to-end eigenvalues the way the previous version's tests could.
 
-/// p-nearest-neighbor count for the graph-pruning step, before computing the Laplacian.
-/// `ln(n)` matches the classic random-graph connectivity threshold (a k-NN graph needs
-/// roughly `k ~ log(n)` neighbors per node to be connected with high probability -- von
-/// Luxburg 2007, graph construction section); the `+1` is a small safety margin since
-/// that result is asymptotic and this project's `n` is small (single digits to a few
-/// hundred segments after `MIN_SEGMENT_DURATION_SECS` filtering), where the asymptotics
-/// are weak. Deliberately not a fixed *fraction* of `n` (the other common heuristic,
-/// e.g. 2-5%): at n=32 that would give p=1, risking disconnecting a genuine same-speaker
-/// subgroup that happens to have few segments -- fraction-based heuristics are tuned for
-/// corpora with thousands of points, not this project's regime.
-fn nearest_neighbor_count(n: usize) -> usize {
-    let raw = (n as f64).ln().round() as usize + 1;
-    raw.clamp(2, n.saturating_sub(1).max(2))
-}
-
-/// Prunes the full affinity matrix to each node's `p` nearest neighbors, then
-/// symmetrizes via `max(A, Aᵀ)` (the "OR" graph: keep edge (i,j) if *either* i ranks j
-/// in its own top-p or j ranks i in its own top-p) -- not the average, and not the
-/// stricter "mutual"/AND graph (both sides must agree). In this project's small-`n`
-/// regime, over-sparsification (accidentally disconnecting a genuine sub-cluster) is the
-/// bigger risk than over-connection, and averaging would halve a genuine strong edge
-/// whenever only one side reciprocated it (e.g. a "hub" segment with many strong
-/// neighbors getting outvoted by a low-degree segment that didn't rank it in its own
-/// top-p) -- the more permissive OR convention avoids that.
-///
-/// Does not preserve the diagonal (self-similarity) -- graph Laplacians are defined over
-/// edges between distinct nodes, a self-loop would double-count in the degree.
-fn prune_to_p_nearest_neighbors(affinity: &[Vec<f64>], p: usize) -> Vec<Vec<f64>> {
-    let n = affinity.len();
+/// Builds the k-nearest-neighbor connectivity graph used by the NME search and the final
+/// clustering: for each node, keep only its `p` most similar neighbors (by cosine
+/// similarity, `similarity[i]` treated as node `i`'s row, self-similarity included in the
+/// ranking), as a binary (0/1) connection, then symmetrize by *averaging* (not max) -- an
+/// edge only one side reciprocated ends at weight 0.5, one both sides agree on ends at
+/// weight 1.0. Matches the reference's `get_kneighbors_conn`/`get_X_conn_from_dist`
+/// exactly, including the quirk that self-similarity (always the maximum possible value)
+/// occupies one of the `p` neighbor slots -- harmless, since
+/// `laplacian_from_connectivity` zeroes the diagonal before computing degrees, same as
+/// the reference's `getLaplacian`. A direct, real consequence worth knowing: `p=1` alone
+/// is always degenerate (every node's only selected neighbor is itself, zeroed away by
+/// the Laplacian step, leaving zero real edges) -- `nme_select_p`'s connectivity fallback
+/// exists partly to route around exactly this.
+fn build_knn_connectivity(similarity: &[Vec<f64>], p: usize) -> Vec<Vec<f64>> {
+    let n = similarity.len();
     let mut directed = vec![vec![0.0f64; n]; n];
     for i in 0..n {
-        let mut neighbors: Vec<usize> = (0..n).filter(|&j| j != i).collect();
-        neighbors.sort_by(|&a, &b| {
-            affinity[i][b]
-                .partial_cmp(&affinity[i][a])
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by(|&a, &b| {
+            similarity[i][b]
+                .partial_cmp(&similarity[i][a])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        for &j in neighbors.iter().take(p) {
-            directed[i][j] = affinity[i][j];
+        for &j in idx.iter().take(p.min(n)) {
+            directed[j][i] = 1.0;
         }
     }
     let mut sym = vec![vec![0.0f64; n]; n];
     for i in 0..n {
         for j in 0..n {
-            sym[i][j] = directed[i][j].max(directed[j][i]);
+            sym[i][j] = 0.5 * (directed[i][j] + directed[j][i]);
         }
     }
     sym
 }
 
-const SPECTRAL_DEGREE_EPSILON: f64 = 1e-9;
+/// True if the connectivity graph (any nonzero entry treated as an edge) is a single
+/// connected component, via breadth-first search from node 0. Matches the reference's
+/// `isFullyConnected`/`_graph_connected_component`. `n == 0` is vacuously true (never
+/// actually reached here -- `cluster_embeddings_spectral_with_p` returns early for
+/// `n <= 2` before any graph is built).
+fn is_fully_connected(graph: &[Vec<f64>]) -> bool {
+    let n = graph.len();
+    if n == 0 {
+        return true;
+    }
+    let mut visited = vec![false; n];
+    let mut queue = std::collections::VecDeque::new();
+    visited[0] = true;
+    queue.push_back(0usize);
+    let mut count = 1usize;
+    while let Some(node) = queue.pop_front() {
+        for (neighbor, &weight) in graph[node].iter().enumerate() {
+            if weight > 0.0 && !visited[neighbor] {
+                visited[neighbor] = true;
+                count += 1;
+                queue.push_back(neighbor);
+            }
+        }
+    }
+    count == n
+}
+
+/// Unnormalized graph Laplacian `L = D - A`, `D` the diagonal degree matrix (row sums of
+/// `|A|`, diagonal of `A` excluded from the sum and zeroed in `L`). Matches the
+/// reference's `getLaplacian` exactly -- deliberately *not* the symmetric-normalized
+/// Laplacian this file's first attempt used (see the module-level comment above for why
+/// comparability across recordings comes from elsewhere in this version).
+fn laplacian_from_connectivity(graph: &[Vec<f64>]) -> DMatrix<f64> {
+    let n = graph.len();
+    let degree: Vec<f64> = (0..n)
+        .map(|i| (0..n).filter(|&j| j != i).map(|j| graph[i][j].abs()).sum())
+        .collect();
+    DMatrix::from_fn(n, n, |r, c| if r == c { degree[r] } else { -graph[r][c] })
+}
+
+/// Ascending-sorted eigenvalues of a symmetric matrix, its (unsorted) eigenvector matrix,
+/// and the permutation needed to read off eigenvector *columns* in the same sorted order
+/// (nalgebra's `SymmetricEigen` returns both eigenvalues and eigenvectors unsorted).
+fn sorted_eigen(matrix: DMatrix<f64>) -> (Vec<f64>, DMatrix<f64>, Vec<usize>) {
+    let n = matrix.nrows();
+    let eigen = SymmetricEigen::new(matrix);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        eigen.eigenvalues[a]
+            .partial_cmp(&eigen.eigenvalues[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let sorted_values: Vec<f64> = order.iter().map(|&i| eigen.eigenvalues[i]).collect();
+    (sorted_values, eigen.eigenvectors, order)
+}
+
+/// Consecutive differences between ascending-sorted eigenvalues: `gaps[i] =
+/// eigenvalues[i+1] - eigenvalues[i]`, one shorter than `eigenvalues`. Matches the
+/// reference's `getLamdaGaplist`.
+fn eigengaps(sorted_eigenvalues: &[f64]) -> Vec<f64> {
+    sorted_eigenvalues.windows(2).map(|w| w[1] - w[0]).collect()
+}
+
+/// Estimated speaker count from a gap sequence: the position of the biggest gap within
+/// the first `max_speakers` gaps, plus one (`gaps[0]` separates the 1st and 2nd
+/// eigenvalues, i.e. supports a 2-cluster split -- the reference's
+/// `estimate_num_of_spkrs` numbers this "+1" the same way). Ties prefer the earliest
+/// (smallest-k) gap, matching numpy's `argmax`. Never returns 0; returns 1 if `gaps` is
+/// empty (not expected to happen given this is only called with n>=3, so gaps has at
+/// least 2 entries, but guarded rather than assumed).
+fn k_from_gaps(gaps: &[f64], max_speakers: usize) -> usize {
+    if gaps.is_empty() {
+        return 1;
+    }
+    let search_len = max_speakers.min(gaps.len());
+    let mut best_idx = 0usize;
+    let mut best_gap = f64::MIN;
+    for (i, &gap) in gaps.iter().take(search_len).enumerate() {
+        if gap > best_gap {
+            best_gap = gap;
+            best_idx = i;
+        }
+    }
+    best_idx + 1
+}
+
+const MAX_RP_THRESHOLD: f64 = 0.25; // reference default: search p up to 25% of n
+const NME_SEARCH_P_VOLUME: usize = 500; // reference default: at most this many candidates
+const NME_EPSILON: f64 = 1e-10; // reference's `eps`, guards the two divisions below
+
+/// The NME auto-search: tries multiple `p` values (up to `MAX_RP_THRESHOLD` of the
+/// segment count) and keeps the one minimizing `(p/n) / (best_normalized_gap + eps)` --
+/// balancing "as sparse a graph as possible" against "still shows a clean, confident
+/// cluster split" (a small p with a messy/absent gap gives a *large* ratio, same as a
+/// large p that's needlessly over-connected -- the minimum sits at the sparsest p that
+/// still finds real structure). `best_normalized_gap` is the biggest gap within the
+/// first `max_speakers` gaps, divided by the largest eigenvalue overall (`+eps`) --
+/// matches the reference's `NMEanalysis` exactly, including the fallback (mirroring
+/// `gc_thres_min_gc`) that raises `p` from 1 upward until the graph is fully connected,
+/// if the ratio-minimizing choice wasn't.
+fn nme_select_p(similarity: &[Vec<f64>], max_speakers: usize) -> usize {
+    let n = similarity.len();
+    // Deviation from the reference, justified by a real project-specific concern: for
+    // small n (short recordings, few accumulated segments -- realistic here in a way the
+    // reference's original speaker-diarization corpora, with hundreds to thousands of
+    // frames, never faced), `floor(n * MAX_RP_THRESHOLD)` alone can collapse to exactly
+    // 1, meaning the "search" only ever considers p=1 -- which is *always* degenerate
+    // (see build_knn_connectivity's doc comment: self always wins the ranking, so p=1
+    // alone selects zero real edges for anyone) and would make this function trivially
+    // always report an empty/fully-disconnected graph regardless of the true structure.
+    // Flooring the search ceiling at 3 gives even small recordings a non-trivial p range
+    // to search (still capped at n-1, so this can't ask for more neighbors than exist).
+    let max_n = (((n as f64) * MAX_RP_THRESHOLD).floor() as usize)
+        .max(3)
+        .min(n.saturating_sub(1).max(1));
+    let candidate_count = max_n.min(NME_SEARCH_P_VOLUME).max(1);
+    let p_candidates: Vec<usize> = if candidate_count == 1 {
+        vec![1]
+    } else {
+        (0..candidate_count)
+            .map(|i| {
+                let t = i as f64 / (candidate_count - 1) as f64;
+                (1.0 + t * (max_n as f64 - 1.0)).round() as usize
+            })
+            .collect()
+    };
+
+    let mut best_p = p_candidates[0];
+    let mut best_ratio = f64::MAX;
+    for &p in &p_candidates {
+        let graph = build_knn_connectivity(similarity, p);
+        let laplacian = laplacian_from_connectivity(&graph);
+        let (sorted_values, _, _) = sorted_eigen(laplacian);
+        let gaps = eigengaps(&sorted_values);
+        let search_len = max_speakers.min(gaps.len());
+        if search_len == 0 {
+            continue;
+        }
+        let best_gap_value = gaps
+            .iter()
+            .take(search_len)
+            .cloned()
+            .fold(f64::MIN, f64::max);
+        let max_eigenvalue = sorted_values.iter().cloned().fold(f64::MIN, f64::max);
+        let normalized_gap = best_gap_value / (max_eigenvalue + NME_EPSILON);
+        let ratio = (p as f64 / n as f64) / (normalized_gap + NME_EPSILON);
+        if ratio < best_ratio {
+            best_ratio = ratio;
+            best_p = p;
+        }
+    }
+
+    let chosen_graph = build_knn_connectivity(similarity, best_p);
+    if !is_fully_connected(&chosen_graph) {
+        for p in 1..=max_n {
+            let graph = build_knn_connectivity(similarity, p);
+            if is_fully_connected(&graph) {
+                return p;
+            }
+        }
+    }
+    best_p
+}
 
 /// Lloyd's k-means on already-embedded points (deterministic "farthest-first" init, no
 /// random restarts -- deliberate: with N/K both small here (spectral embeddings of a
@@ -386,13 +577,12 @@ pub fn cluster_embeddings_spectral(embeddings: &[Vec<f32>], max_speakers: usize)
 }
 
 /// Same as `cluster_embeddings_spectral`, but lets the caller override the p-nearest-
-/// neighbor pruning count instead of always using `nearest_neighbor_count`'s `ln(n)+1`
-/// formula. Exists for `examples/diarization_calibration.rs` to experiment with `p` on
-/// real recordings (the two hardest calibration files, with more true speakers, under-
-/// estimated the speaker count with the default formula -- see docs/sviluppi/diarization/
-/// Architettura pipeline.md, "Primo confronto reale..." -- a larger `p` is one plausible
-/// fix, to be validated empirically like everything else in this file, not assumed).
-/// `None` reproduces the exact default-formula behavior of `cluster_embeddings_spectral`.
+/// neighbor pruning count instead of running the NME auto-search (`nme_select_p`) for it.
+/// Exists for `examples/diarization_calibration.rs` to experiment with a fixed `p` on
+/// real recordings -- a real calibration run (see docs/sviluppi/diarization/Architettura
+/// pipeline.md, "Tentativo di fix: p fisso...") showed that a single fixed `p` cannot
+/// generalize across recordings of very different size, which is exactly why the
+/// default (`None`) now runs the full per-recording search instead of a fixed formula.
 pub fn cluster_embeddings_spectral_with_p(
     embeddings: &[Vec<f32>],
     max_speakers: usize,
@@ -407,16 +597,12 @@ pub fn cluster_embeddings_spectral_with_p(
     }
     let max_speakers = max_speakers.max(1);
 
-    // N=2 is a special case, not just an optimization: for exactly 2 nodes, the
-    // symmetric normalized Laplacian's eigenvalues are always exactly {0, 2} whenever
-    // the two points have any positive similarity, *regardless of the similarity's
-    // magnitude* (the degree term cancels out algebraically: D^(-1/2) A D^(-1/2) reduces
-    // to [[0,1],[1,0]] for any single positive edge weight w>0, whose eigenvalues are
-    // {1,-1}, giving Laplacian eigenvalues {1-1, 1-(-1)} = {0,2} independent of w). The
-    // eigengap step is therefore mathematically uninformative at n=2 -- it cannot tell
-    // "barely similar" from "very similar" -- so a direct threshold comparison is used
-    // instead (the one deliberate point of contact with the calibrated threshold
-    // approach).
+    // N=2 is a special case, not just an optimization: with only 2 nodes there is only
+    // ever one possible edge, so no eigengap search can say anything a direct similarity
+    // comparison couldn't (and, per the module-level comment above, `p=1` alone -- the
+    // only value that could apply here -- is degenerate by construction). Unaffected by
+    // the Laplacian-formulation change above/below: this bypasses the graph/Laplacian
+    // machinery entirely either way.
     if n == 2 {
         let similar =
             cosine_similarity(&embeddings[0], &embeddings[1]) >= DEFAULT_CLUSTERING_THRESHOLD;
@@ -427,107 +613,43 @@ pub fn cluster_embeddings_spectral_with_p(
         };
     }
 
-    // Affinity matrix: cosine similarity, negatives clipped to zero (graph Laplacian
-    // theory assumes nonnegative edge weights).
-    let mut affinity = vec![vec![0.0f64; n]; n];
+    // Full cosine similarity matrix, diagonal included (self-similarity = 1.0, always
+    // the maximum possible value -- see build_knn_connectivity's doc comment on why that
+    // matters). No negative-clipping here, unlike the first attempt: the reference never
+    // clips, since the matrix is only ever used for *ranking* neighbors (build_knn_
+    // connectivity), and the eventual edge weight is binary regardless of the exact
+    // similarity value once a neighbor is selected.
+    let mut similarity = vec![vec![0.0f64; n]; n];
     for i in 0..n {
+        similarity[i][i] = 1.0;
         for j in (i + 1)..n {
-            let sim = cosine_similarity(&embeddings[i], &embeddings[j]).max(0.0) as f64;
-            affinity[i][j] = sim;
-            affinity[j][i] = sim;
+            let sim = cosine_similarity(&embeddings[i], &embeddings[j]) as f64;
+            similarity[i][j] = sim;
+            similarity[j][i] = sim;
         }
     }
 
     let p = p_override
-        .unwrap_or_else(|| nearest_neighbor_count(n))
-        .clamp(2, n.saturating_sub(1).max(2));
-    let mut affinity_final = prune_to_p_nearest_neighbors(&affinity, p);
+        .unwrap_or_else(|| nme_select_p(&similarity, max_speakers))
+        .max(1);
 
-    let mut degree = vec![0.0f64; n];
-    for i in 0..n {
-        degree[i] = affinity_final[i].iter().sum();
-        if degree[i] < SPECTRAL_DEGREE_EPSILON {
-            // Degenerate: this segment has ~zero similarity to every other segment
-            // (should not happen with real speech embeddings, but guarded rather than
-            // assumed impossible). Treat as its own trivial component via a self-loop.
-            affinity_final[i][i] = 1.0;
-            degree[i] = 1.0;
-        }
-    }
-
-    // Symmetric normalized Laplacian: L = I - D^(-1/2) A D^(-1/2). Chosen over the
-    // unnormalized L = D - A (whose eigenvalues scale with max degree, not comparable
-    // in magnitude across recordings of very different sizes -- bad for a "biggest gap"
-    // heuristic meant to run unattended on many different recordings) and over the
-    // random-walk normalization (Ng-Jordan-Weiss 2002 established the symmetric
-    // normalization as the robust choice for exactly this eigengap-based approach).
-    let d_inv_sqrt: Vec<f64> = degree.iter().map(|d| 1.0 / d.sqrt()).collect();
-    let laplacian_raw = DMatrix::from_fn(n, n, |r, c| {
-        let identity = if r == c { 1.0 } else { 0.0 };
-        identity - d_inv_sqrt[r] * affinity_final[r][c] * d_inv_sqrt[c]
-    });
-    // Defensive re-symmetrization against floating-point asymmetry, built explicitly via
-    // from_fn (not nalgebra's operator overloads) to keep every step here unambiguous
-    // without a compiler on hand to double-check trait resolution.
-    let laplacian_t = laplacian_raw.transpose();
-    let laplacian = DMatrix::from_fn(n, n, |r, c| 0.5 * (laplacian_raw[(r, c)] + laplacian_t[(r, c)]));
-
-    let eigen = SymmetricEigen::new(laplacian);
-
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| {
-        eigen.eigenvalues[a]
-            .partial_cmp(&eigen.eigenvalues[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let sorted_eigenvalues: Vec<f64> = order.iter().map(|&i| eigen.eigenvalues[i]).collect();
-
-    // Eigengap: the biggest jump between consecutive sorted eigenvalues, searched only
-    // within 1..=k_max so K is never 0 and never exceeds the cap. Ties prefer the
-    // smaller k -- deliberate, since the entire premise of this experiment is that the
-    // threshold approach *over*-clusters.
-    //
-    // Non-obvious, hand-verified behavior: if the graph's true number of components
-    // exceeds max_speakers, this does NOT generally land on k = max_speakers. If every
-    // candidate gap within the capped search range sits on the same near-zero
-    // "eigenvalue-zero plateau" (i.e. the capped range ends before the real structural
-    // gap), every gap in range ties at ~0 and the tie-break rule collapses the estimate
-    // down to k=1 -- still respects "never exceed the cap", just not the naively
-    // expected "clip to the cap". See the
-    // spectral_true_k_exceeding_max_speakers_never_exceeds_the_cap test. This is why
-    // callers should pass a generous max_speakers, not a tight guess.
-    let k_max = max_speakers.min(n - 1);
-    let mut best_k = 1usize;
-    let mut best_gap = f64::MIN;
-    for k in 1..=k_max {
-        let gap = sorted_eigenvalues[k] - sorted_eigenvalues[k - 1];
-        if gap > best_gap {
-            best_gap = gap;
-            best_k = k;
-        }
-    }
-    let k = best_k;
+    let graph = build_knn_connectivity(&similarity, p);
+    let laplacian = laplacian_from_connectivity(&graph);
+    let (sorted_values, eigenvectors, order) = sorted_eigen(laplacian);
+    let gaps = eigengaps(&sorted_values);
+    let k = k_from_gaps(&gaps, max_speakers).max(1).min(max_speakers);
 
     if k == 1 {
         return vec![0; n];
     }
 
-    // Row-normalized spectral embedding (Ng-Jordan-Weiss 2002): in the ideal
-    // block-diagonal case, points in the same connected component get eigenvector
-    // entries that are constant but scaled by that point's own degree -- row-normalizing
-    // to unit length removes this per-point scale so members of the same true cluster
-    // map to the *same* point on the unit hypersphere regardless of individual degree
-    // variation (e.g. a "chatty" segment with many neighbors vs. a sparser one).
+    // No row-normalization here (unlike the first attempt's Ng-Jordan-Weiss step) --
+    // the reference hardcodes `norm_laplacian=False` and uses the raw eigenvector
+    // entries directly; removed for fidelity, see the module-level comment above.
     let mut rows: Vec<Vec<f64>> = vec![vec![0.0; k]; n];
     for row in 0..n {
         for (col, &eig_idx) in order.iter().take(k).enumerate() {
-            rows[row][col] = eigen.eigenvectors[(row, eig_idx)];
-        }
-        let norm: f64 = rows[row].iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm > SPECTRAL_DEGREE_EPSILON {
-            for v in rows[row].iter_mut() {
-                *v /= norm;
-            }
+            rows[row][col] = eigenvectors[(row, eig_idx)];
         }
     }
 
@@ -688,16 +810,143 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------------
-    // cluster_embeddings_spectral
+    // Sub-components of the NME-SC spectral clustering pipeline (build_knn_connectivity,
+    // is_fully_connected, eigengaps, k_from_gaps) -- exactly hand-verifiable in
+    // isolation, unlike the full pipeline (see the note on the end-to-end tests further
+    // below on why exact eigenvalues stopped being hand-derivable once this file switched
+    // from its own first attempt to a faithful translation of the real NME-SC reference).
+    // ------------------------------------------------------------------------------
+
+    #[test]
+    fn eigengaps_computes_consecutive_differences() {
+        assert_eq!(eigengaps(&[0.0, 0.0, 2.0, 2.5]), vec![0.0, 2.0, 0.5]);
+        assert_eq!(eigengaps(&[1.0]), Vec::<f64>::new());
+        assert_eq!(eigengaps(&[]), Vec::<f64>::new());
+    }
+
+    #[test]
+    fn k_from_gaps_picks_the_biggest_gap_plus_one() {
+        // Biggest gap (3.0) sits at index 2 -> k = 2 + 1 = 3.
+        assert_eq!(k_from_gaps(&[0.1, 0.05, 3.0, 0.2], 4), 3);
+    }
+
+    #[test]
+    fn k_from_gaps_ties_prefer_the_earliest_index() {
+        assert_eq!(k_from_gaps(&[1.0, 1.0, 0.2], 3), 1);
+    }
+
+    #[test]
+    fn k_from_gaps_capping_does_not_simply_clip_to_the_cap() {
+        // The real signal (3.0 at index 2) sits *beyond* max_speakers=2's search window
+        // (only indices 0..2 are examined) -- capping picks the best *within that
+        // window* (both 0.1 and 0.05 are candidates, 0.1 at index 0 wins), landing on
+        // k=1, not k=2. Same non-obvious "doesn't clip to the cap" behavior the previous
+        // version of this file's tests demonstrated end-to-end -- reproduced here as an
+        // exact, trivial arithmetic check instead, since it no longer requires running
+        // the full eigendecomposition pipeline to exercise.
+        assert_eq!(k_from_gaps(&[0.1, 0.05, 3.0, 0.2], 2), 1);
+    }
+
+    #[test]
+    fn k_from_gaps_empty_returns_one() {
+        assert_eq!(k_from_gaps(&[], 5), 1);
+    }
+
+    #[test]
+    fn is_fully_connected_detects_a_single_chain() {
+        // 0-1-2-3 chain: one connected component.
+        let graph = vec![
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![1.0, 0.0, 1.0, 0.0],
+            vec![0.0, 1.0, 0.0, 1.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ];
+        assert!(is_fully_connected(&graph));
+    }
+
+    #[test]
+    fn is_fully_connected_detects_two_disjoint_pairs() {
+        // Edges (0-1) and (2-3) only -- two components, not one.
+        let graph = vec![
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+        ];
+        assert!(!is_fully_connected(&graph));
+    }
+
+    #[test]
+    fn build_knn_connectivity_keeps_top_p_and_averages_symmetrization() {
+        // 3 points, similarity[i] strictly ranked (no ties) so top-p selection is
+        // unambiguous: node 0's neighbors by similarity are [2 (0.9), 1 (0.5)] (self
+        // excluded from this description, though it participates in the real ranking --
+        // see the function's doc comment); node 1's are [0 (0.5), 2 (0.1)]; node 2's are
+        // [0 (0.9), 1 (0.1)]. With p=2 (self + 1 real neighbor each): node0 keeps 2 (its
+        // top real pick), node1 keeps 0, node2 keeps 0. Edge (0,2) is picked by *both*
+        // sides -> symmetrized weight 1.0. Edge (0,1) is picked by node1 only (node0
+        // preferred node2 over node1) -> symmetrized weight 0.5. Edge (1,2) picked by
+        // neither -> 0.0.
+        let similarity = vec![
+            vec![1.0, 0.5, 0.9],
+            vec![0.5, 1.0, 0.1],
+            vec![0.9, 0.1, 1.0],
+        ];
+        let graph = build_knn_connectivity(&similarity, 2);
+        assert_eq!(graph[0][2], 1.0);
+        assert_eq!(graph[2][0], 1.0);
+        assert_eq!(graph[0][1], 0.5);
+        assert_eq!(graph[1][0], 0.5);
+        assert_eq!(graph[1][2], 0.0);
+        assert_eq!(graph[2][1], 0.0);
+    }
+
+    #[test]
+    fn build_knn_connectivity_p_one_is_always_empty_after_self_is_excluded() {
+        // Documents the real quirk relied on elsewhere (nme_select_p's small-n floor,
+        // and the connectivity fallback): with p=1, every node's only selected neighbor
+        // is itself (self-similarity is always the maximum possible value), so the
+        // *connectivity* graph -- which laplacian_from_connectivity later reads with the
+        // diagonal excluded -- carries no real edges at all.
+        let similarity = vec![
+            vec![1.0, 0.5, 0.2],
+            vec![0.5, 1.0, 0.1],
+            vec![0.2, 0.1, 1.0],
+        ];
+        let graph = build_knn_connectivity(&similarity, 1);
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    assert_eq!(graph[i][j], 0.0, "no real edge expected at p=1");
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------------
+    // cluster_embeddings_spectral -- end-to-end tests.
     //
-    // These deliberately use *exactly* orthogonal one-hot vectors (`vec![1.0, 0.0, ...]`),
-    // not the `unit(mostly, dim)` helper above (which has 0.01 leakage in every other
-    // dimension). With exact orthogonality, cross-cluster cosine similarity is a literal
-    // 0.0, so the pruned/symmetrized graph is exactly block-diagonal *regardless* of the
-    // p-nearest-neighbor selection or tie-breaking order -- which is what makes the
-    // expected eigenvalues hand-computable at all without running the code. `unit()`'s
-    // leakage would reintroduce small nonzero cross-similarities whose effect on the
-    // eigengap can't be pinned down by hand.
+    // Honest note on verification level (see the module-level comment above
+    // cluster_embeddings_spectral_with_p for the full explanation): this file's first
+    // attempt at spectral clustering used exactly-orthogonal one-hot test vectors and
+    // hand-derived the exact expected eigenvalues, which was possible because that
+    // version's math (weighted graph, symmetric normalized Laplacian) made the
+    // block-diagonal structure clean and tie-free. This version's real reference
+    // algorithm (binary graph, self always occupying one neighbor slot, a connectivity
+    // fallback that actively resists exactly-zero cross-cluster similarity) makes exact
+    // ties and exactly-zero cross-similarity into *adversarial* inputs, not safe test
+    // vectors, for reasons traced through in detail while designing this rewrite. The
+    // tests below instead use clearly-separated but non-adversarial vectors (distinct,
+    // non-tied similarities; small but nonzero cross-group similarity, mimicking real
+    // embeddings, which never have exactly-zero cross-speaker similarity either) and
+    // check only the qualitative, structurally-guaranteed outcome (same true group ->
+    // same label, different true group -> different label) rather than exact
+    // eigenvalues -- resting on spectral clustering's well-established general
+    // guarantee on clearly block-structured data, not on a hand re-derivation of this
+    // specific case. This is a real, deliberate reduction in verification rigor compared
+    // to the sub-component tests above, made necessary by the algorithm change; the
+    // actual calibration run against 5 real recordings (see docs/sviluppi/diarization/
+    // Architettura pipeline.md) is what ultimately validates this, not these tests alone.
     // ------------------------------------------------------------------------------
 
     #[test]
@@ -713,9 +962,9 @@ mod tests {
     #[test]
     fn spectral_two_similar_embeddings_merge() {
         // Identical vectors: cosine similarity 1.0 >= DEFAULT_CLUSTERING_THRESHOLD (0.6)
-        // -- n=2 is a special case (see cluster_embeddings_spectral's doc comment): the
-        // eigengap is mathematically uninformative at n=2, so this falls back to a
-        // direct threshold comparison.
+        // -- n=2 is a special case (see cluster_embeddings_spectral_with_p's doc
+        // comment): the eigengap is mathematically uninformative at n=2, so this falls
+        // back to a direct threshold comparison, unaffected by the NME rewrite.
         let e = vec![1.0, 0.0, 0.0];
         assert_eq!(cluster_embeddings_spectral(&[e.clone(), e], 5), vec![0, 0]);
     }
@@ -728,82 +977,36 @@ mod tests {
     }
 
     #[test]
-    fn spectral_two_well_separated_clusters_estimates_k_two() {
-        // Two orthogonal one-hot directions (dim=2), 3 identical copies each. Hand-derived
-        // eigenvalues: each group of 3 identical vectors forms a complete weight-1 K3
-        // subgraph (cross-group similarity is exactly 0.0, so it can never contribute to
-        // the pruned graph regardless of which neighbors p-NN selects). A weight-1 K3 has
-        // adjacency eigenvalues {2, -1, -1} (standard complete-graph spectrum) with
-        // uniform degree d=2, so D^(-1/2)AD^(-1/2) = A/2 has eigenvalues {1, -0.5, -0.5},
-        // giving Laplacian eigenvalues I - that = {0, 1.5, 1.5} per block. Two disjoint
-        // blocks -> overall sorted eigenvalues [0, 0, 1.5, 1.5, 1.5, 1.5]. Gaps:
-        // gap(1)=0, gap(2)=1.5, gap(3..5)=0 -- unique max at k=2.
-        let a = vec![1.0, 0.0];
-        let b = vec![0.0, 1.0];
-        let embeddings = vec![a.clone(), a.clone(), a, b.clone(), b.clone(), b];
-        let labels = cluster_embeddings_spectral(&embeddings, 5);
-        assert_eq!(distinct_speaker_count(&labels), 2);
-        assert_eq!(labels[0], labels[1]);
-        assert_eq!(labels[1], labels[2]);
-        assert_eq!(labels[3], labels[4]);
-        assert_eq!(labels[4], labels[5]);
-        assert_ne!(labels[0], labels[3]);
+    fn spectral_two_clearly_separated_groups_of_eight() {
+        // 16 points, two groups of 8 (dim=3): group A dominant in axis 0, group B
+        // dominant in axis 1, each member perturbed by a small per-index amount so no
+        // two similarities are exactly tied, and a small shared cross-term so no
+        // cross-group similarity is exactly zero either (both properties real speech
+        // embeddings would have anyway, and both needed to avoid the adversarial-input
+        // pitfalls described above). Within-group cosine similarity is ~0.99+; cross-
+        // group is ~0.05-0.15 -- a clear, non-adversarial separation.
+        let mut embeddings = Vec::with_capacity(16);
+        for i in 0..8 {
+            let f = i as f64;
+            embeddings.push(vec![1.0, 0.05 + 0.01 * f, 0.02]);
+        }
+        for i in 0..8 {
+            let f = i as f64;
+            embeddings.push(vec![0.02, 1.0, 0.05 + 0.01 * f]);
+        }
+        let labels = cluster_embeddings_spectral(&embeddings, 10);
+        assert_eq!(distinct_speaker_count(&labels), 2, "expected exactly 2 groups");
+        for i in 1..8 {
+            assert_eq!(labels[0], labels[i], "group A member {i} split off from the rest of group A");
+        }
+        for i in 9..16 {
+            assert_eq!(labels[8], labels[i], "group B member {i} split off from the rest of group B");
+        }
+        assert_ne!(labels[0], labels[8], "group A and group B were merged into one cluster");
     }
 
     #[test]
-    fn spectral_three_well_separated_clusters_estimates_k_three() {
-        // Three orthogonal one-hot directions (dim=3), 2 identical copies each. Each pair
-        // forms a disjoint weight-1 K2 (single edge, degree=1): D^(-1/2)AD^(-1/2) reduces
-        // to [[0,1],[1,0]] (eigenvalues {1,-1}), giving Laplacian eigenvalues {0, 2} per
-        // block. Three disjoint blocks -> sorted eigenvalues [0, 0, 0, 2, 2, 2]. Gaps:
-        // gap(1)=0, gap(2)=0, gap(3)=2, gap(4)=0, gap(5)=0 -- unique max at k=3.
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![0.0, 1.0, 0.0];
-        let c = vec![0.0, 0.0, 1.0];
-        let embeddings = vec![a.clone(), a, b.clone(), b, c.clone(), c];
-        let labels = cluster_embeddings_spectral(&embeddings, 5);
-        assert_eq!(distinct_speaker_count(&labels), 3);
-        assert_eq!(labels[0], labels[1]);
-        assert_eq!(labels[2], labels[3]);
-        assert_eq!(labels[4], labels[5]);
-        assert_ne!(labels[0], labels[2]);
-        assert_ne!(labels[0], labels[4]);
-        assert_ne!(labels[2], labels[4]);
-    }
-
-    #[test]
-    fn spectral_true_k_exceeding_max_speakers_never_exceeds_the_cap() {
-        // Same embeddings as spectral_three_well_separated_clusters_estimates_k_three
-        // (true K=3, eigenvalues [0,0,0,2,2,2] exactly), but max_speakers=2 this time.
-        //
-        // Hand-verified, non-obvious outcome: capping does NOT land on K=2 here. With
-        // k_max=2, only gap(1)=eigenvalues[1]-eigenvalues[0]=0-0=0 and
-        // gap(2)=eigenvalues[2]-eigenvalues[1]=0-0=0 are in range -- both exactly 0 (the
-        // real signal, gap(3)=2, sits beyond the cap and is never examined). The tie-break
-        // rule (prefer the smaller k) collapses the estimate all the way to K=1, not K=2.
-        // This still satisfies "never exceed max_speakers" (1 <= 2), just not via the
-        // naively-expected "clip to the cap" path -- documented here rather than
-        // discovered later against real over-segmented recordings, which is exactly why
-        // `examples/diarization_calibration.rs` should pass a generous max_speakers, not
-        // a tight guess.
-        let a = vec![1.0, 0.0, 0.0];
-        let b = vec![0.0, 1.0, 0.0];
-        let c = vec![0.0, 0.0, 1.0];
-        let embeddings = vec![a.clone(), a, b.clone(), b, c.clone(), c];
-        let labels = cluster_embeddings_spectral(&embeddings, 2);
-        assert!(
-            distinct_speaker_count(&labels) <= 2,
-            "must never exceed max_speakers"
-        );
-        assert_eq!(
-            distinct_speaker_count(&labels),
-            1,
-            "collapses to 1 here -- see comment above"
-        );
-    }
-
-    #[test]
-    fn spectral_with_p_none_matches_the_default_formula() {
+    fn spectral_with_p_none_matches_the_default_search() {
         // cluster_embeddings_spectral must be exactly cluster_embeddings_spectral_with_p
         // with p_override=None -- a regression guard on the delegation itself, not on the
         // algorithm (already covered by the tests above).
@@ -816,11 +1019,10 @@ mod tests {
     }
 
     #[test]
-    fn spectral_with_p_override_clamps_without_panicking() {
-        // Extreme p_override values (0, and far beyond n) must clamp instead of panicking
-        // -- exact resulting labels aren't asserted here (unlike the hand-verified tests
-        // above, changing p can change the graph structure in ways not worth re-deriving
-        // by hand for this regression guard), only that the function stays well-behaved.
+    fn spectral_with_p_override_does_not_panic() {
+        // Extreme p_override values (0, and far beyond n) must not panic -- exact
+        // resulting labels aren't asserted here, only that the function stays
+        // well-behaved regardless of what p is forced to.
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![0.0, 1.0, 0.0];
         let c = vec![0.0, 0.0, 1.0];
