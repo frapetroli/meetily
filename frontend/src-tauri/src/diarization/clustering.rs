@@ -976,33 +976,62 @@ mod tests {
         assert_ne!(labels[0], labels[1]);
     }
 
+    /// Tiny deterministic PRNG (fixed seed, no external `rand` dependency) used only to
+    /// build isotropic-looking noise for `spectral_two_clearly_separated_groups`. Returns
+    /// values roughly in [-0.5, 0.5).
+    fn lcg_next(state: &mut u32) -> f32 {
+        *state = state.wrapping_mul(1103515245).wrapping_add(12345);
+        ((*state >> 16) & 0x7fff) as f32 / 32768.0 - 0.5
+    }
+
     #[test]
-    fn spectral_two_clearly_separated_groups_of_eight() {
-        // 16 points, two groups of 8 (dim=3): group A dominant in axis 0, group B
-        // dominant in axis 1, each member perturbed by a small per-index amount so no
-        // two similarities are exactly tied, and a small shared cross-term so no
-        // cross-group similarity is exactly zero either (both properties real speech
-        // embeddings would have anyway, and both needed to avoid the adversarial-input
-        // pitfalls described above). Within-group cosine similarity is ~0.99+; cross-
-        // group is ~0.05-0.15 -- a clear, non-adversarial separation.
-        let mut embeddings = Vec::with_capacity(16);
-        for i in 0..8 {
-            let f = i as f32;
-            embeddings.push(vec![1.0, 0.05 + 0.01 * f, 0.02]);
+    fn spectral_two_clearly_separated_groups() {
+        // 40 points, two groups of 20 (dim = 2 dominant + 12 noise dims). An earlier
+        // version of this test perturbed each member along a *single shared* axis by a
+        // small per-index amount (e.g. member i's noise = 0.01*i on one dimension) to
+        // avoid exact ties. That is a real bug in the test, discovered empirically: a
+        // single shared perturbation axis puts every member of the group on a 1-D
+        // manifold, so the induced k-NN graph is a *path*, not a blob -- and a path
+        // graph's Laplacian spectrum has its own internal harmonics (consecutive gaps
+        // comparable in size to the gap that separates the two true groups). The
+        // eigengap heuristic legitimately read those harmonics as extra sub-clusters and
+        // reported 4 groups instead of 2 -- correct behavior of the algorithm on data
+        // that was not actually blob-shaped, not a bug in `cluster_embeddings_spectral`.
+        //
+        // Real speaker embeddings vary across many largely-independent dimensions around
+        // a per-speaker centroid, which is what this construction approximates: each
+        // member gets independent pseudo-random noise (fixed-seed LCG) spread across 12
+        // dimensions, so no single axis dominates the within-group similarity structure.
+        // Group size is also increased from 8 to 20 so the automatic k-NN pruning
+        // (capped at `max_n = floor(0.25*n)`, `nme_select_p`) has enough same-group
+        // candidates to build a properly dense (non-chain, non-hub) subgraph.
+        let mut seed = 42u32;
+        let n_per_group = 20;
+        let noise_dims = 12;
+        let mut embeddings = Vec::with_capacity(n_per_group * 2);
+        for _ in 0..n_per_group {
+            let mut v = vec![1.0f32, 0.05];
+            for _ in 0..noise_dims {
+                v.push(0.05 * lcg_next(&mut seed));
+            }
+            embeddings.push(v);
         }
-        for i in 0..8 {
-            let f = i as f32;
-            embeddings.push(vec![0.02, 1.0, 0.05 + 0.01 * f]);
+        for _ in 0..n_per_group {
+            let mut v = vec![0.05f32, 1.0];
+            for _ in 0..noise_dims {
+                v.push(0.05 * lcg_next(&mut seed));
+            }
+            embeddings.push(v);
         }
         let labels = cluster_embeddings_spectral(&embeddings, 10);
         assert_eq!(distinct_speaker_count(&labels), 2, "expected exactly 2 groups");
-        for i in 1..8 {
+        for i in 1..n_per_group {
             assert_eq!(labels[0], labels[i], "group A member {i} split off from the rest of group A");
         }
-        for i in 9..16 {
-            assert_eq!(labels[8], labels[i], "group B member {i} split off from the rest of group B");
+        for i in (n_per_group + 1)..(2 * n_per_group) {
+            assert_eq!(labels[n_per_group], labels[i], "group B member {i} split off from the rest of group B");
         }
-        assert_ne!(labels[0], labels[8], "group A and group B were merged into one cluster");
+        assert_ne!(labels[0], labels[n_per_group], "group A and group B were merged into one cluster");
     }
 
     #[test]
