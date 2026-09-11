@@ -61,6 +61,24 @@ struct Cli {
     /// on why capping too tightly can collapse the estimate well below the cap.
     #[arg(long, default_value_t = 20)]
     max_speakers: usize,
+
+    /// Comma-separated list of p-nearest-neighbor pruning counts to try with the spectral
+    /// method (see `cluster_embeddings_spectral_with_p`), instead of always using its
+    /// default `ln(n)+1` formula. Omit to run once with the default formula only. Useful
+    /// for experimenting on recordings where the default formula under- or over-estimates
+    /// the speaker count -- see docs/sviluppi/diarization/Architettura pipeline.md, "Primo
+    /// confronto reale...". Example: `--nearest-neighbors 10,15,25`.
+    #[arg(long)]
+    nearest_neighbors: Option<String>,
+
+    /// Skip the threshold/reattach grid entirely (and its aggregate table), running only
+    /// the spectral method. The expensive part -- decoding + ONNX segmentation/embedding
+    /// -- happens once regardless and is shared by both methods, so this does NOT skip
+    /// that; it only skips the (non-trivial, especially on longer recordings with more
+    /// accumulated segments) threshold-clustering grid, which the spectral method doesn't
+    /// need. Useful when iterating on --nearest-neighbors and re-running repeatedly.
+    #[arg(long, default_value_t = false)]
+    skip_threshold_grid: bool,
 }
 
 struct GroundTruthTurn {
@@ -89,6 +107,16 @@ fn parse_threshold_list(s: &str) -> Result<Vec<f32>> {
             part.trim()
                 .parse::<f32>()
                 .with_context(|| format!("invalid threshold value: {part:?}"))
+        })
+        .collect()
+}
+
+fn parse_usize_list(s: &str) -> Result<Vec<usize>> {
+    s.split(',')
+        .map(|part| {
+            part.trim()
+                .parse::<usize>()
+                .with_context(|| format!("invalid integer value: {part:?}"))
         })
         .collect()
 }
@@ -311,6 +339,12 @@ fn main() -> Result<()> {
 
     let clustering_thresholds = parse_threshold_list(&cli.clustering_thresholds)?;
     let reattach_thresholds = parse_threshold_list(&cli.reattach_thresholds)?;
+    // One entry per p value to try with the spectral method; `None` means "use the
+    // default ln(n)+1 formula". Absent --nearest-neighbors -> a single default-only run.
+    let p_values: Vec<Option<usize>> = match &cli.nearest_neighbors {
+        Some(s) => parse_usize_list(s)?.into_iter().map(Some).collect(),
+        None => vec![None],
+    };
 
     let segmentation_model_path = cli.models_dir.join("segmentation-model.onnx");
     let embedding_model_path = cli.models_dir.join("embedding-model.onnx");
@@ -332,7 +366,7 @@ fn main() -> Result<()> {
     println!("Found {} recording(s) to calibrate against.\n", recordings.len());
 
     let mut all_results: Vec<(String, GridResult)> = Vec::new();
-    let mut spectral_results: Vec<(String, usize, usize, f64)> = Vec::new(); // (name, detected, true, accuracy)
+    let mut spectral_results: Vec<(String, String, usize, usize, f64)> = Vec::new(); // (name, p_label, detected, true, accuracy)
 
     for recording in &recordings {
         println!("=== {} ===", recording.name);
@@ -360,94 +394,134 @@ fn main() -> Result<()> {
             .process_chunk(&samples, 0.0)
             .map_err(|e| anyhow!("process_chunk failed: {e}"))?;
 
-        println!(
-            "  {:>6} | {:>8} | {:>9} | {:>9} | {:>12}",
-            "clust", "reattach", "detected", "true", "turn acc %"
-        );
-        for &ct in &clustering_thresholds {
-            for &rt in &reattach_thresholds {
-                let segments = engine.finalize_with_thresholds(ct, MIN_CLUSTER_SIZE, rt);
-                let detected = distinct_speaker_count(&segments);
-                let accuracy = score_against_ground_truth(&segments, &ground_truth);
-                println!(
-                    "  {:>6.2} | {:>8.2} | {:>9} | {:>9} | {:>12.1}",
-                    ct, rt, detected, true_speaker_count, accuracy
-                );
-                all_results.push((
-                    recording.name.clone(),
-                    GridResult {
-                        clustering_threshold: ct,
-                        reattach_threshold: rt,
-                        detected_speaker_count: detected,
-                        true_speaker_count,
-                        turn_accuracy_pct: accuracy,
-                    },
-                ));
+        if cli.skip_threshold_grid {
+            println!("  (griglia soglia-per-soglia saltata: --skip-threshold-grid)");
+        } else {
+            println!(
+                "  {:>6} | {:>8} | {:>9} | {:>9} | {:>12}",
+                "clust", "reattach", "detected", "true", "turn acc %"
+            );
+            for &ct in &clustering_thresholds {
+                for &rt in &reattach_thresholds {
+                    let segments = engine.finalize_with_thresholds(ct, MIN_CLUSTER_SIZE, rt);
+                    let detected = distinct_speaker_count(&segments);
+                    let accuracy = score_against_ground_truth(&segments, &ground_truth);
+                    println!(
+                        "  {:>6.2} | {:>8.2} | {:>9} | {:>9} | {:>12.1}",
+                        ct, rt, detected, true_speaker_count, accuracy
+                    );
+                    all_results.push((
+                        recording.name.clone(),
+                        GridResult {
+                            clustering_threshold: ct,
+                            reattach_threshold: rt,
+                            detected_speaker_count: detected,
+                            true_speaker_count,
+                            turn_accuracy_pct: accuracy,
+                        },
+                    ));
+                }
             }
         }
 
         // Experimental spectral method -- same already-accumulated embeddings, no second
         // ONNX inference pass. Printed separately since it isn't part of the
-        // threshold/reattach grid (it has its own single parameter, max_speakers).
-        let spectral_segments = engine.finalize_with_spectral(cli.max_speakers);
-        let spectral_detected = distinct_speaker_count(&spectral_segments);
-        let spectral_accuracy = score_against_ground_truth(&spectral_segments, &ground_truth);
-        println!(
-            "  spectral (max_speakers={}) | detected {:>3} | true {:>3} | turn acc {:>5.1}%",
-            cli.max_speakers, spectral_detected, true_speaker_count, spectral_accuracy
-        );
-        spectral_results.push((recording.name.clone(), spectral_detected, true_speaker_count, spectral_accuracy));
+        // threshold/reattach grid (it has its own parameters, max_speakers/nearest_neighbors).
+        // One run per p value in p_values (just [None] -- the default formula -- if
+        // --nearest-neighbors was omitted).
+        for &p_override in &p_values {
+            let spectral_segments = engine.finalize_with_spectral_and_p(cli.max_speakers, p_override);
+            let spectral_detected = distinct_speaker_count(&spectral_segments);
+            let spectral_accuracy = score_against_ground_truth(&spectral_segments, &ground_truth);
+            let p_label = p_override.map(|p| p.to_string()).unwrap_or_else(|| "auto".to_string());
+            println!(
+                "  spectral (max_speakers={}, p={}) | detected {:>3} | true {:>3} | turn acc {:>5.1}%",
+                cli.max_speakers, p_label, spectral_detected, true_speaker_count, spectral_accuracy
+            );
+            spectral_results.push((
+                recording.name.clone(),
+                p_label,
+                spectral_detected,
+                true_speaker_count,
+                spectral_accuracy,
+            ));
+        }
 
         println!();
     }
 
-    println!("=== Aggregato per combinazione di soglie (media su {} registrazioni) ===", recordings.len());
-    println!(
-        "  {:>6} | {:>8} | {:>16} | {:>12}",
-        "clust", "reattach", "avg |detected-true|", "avg turn acc %"
-    );
-    for &ct in &clustering_thresholds {
-        for &rt in &reattach_thresholds {
-            let matching: Vec<&GridResult> = all_results
-                .iter()
-                .map(|(_, r)| r)
-                .filter(|r| r.clustering_threshold == ct && r.reattach_threshold == rt)
-                .collect();
-            let n = matching.len() as f64;
-            let avg_count_error: f64 = matching
-                .iter()
-                .map(|r| (r.detected_speaker_count as f64 - r.true_speaker_count as f64).abs())
-                .sum::<f64>()
-                / n;
-            let avg_accuracy: f64 = matching.iter().map(|r| r.turn_accuracy_pct).sum::<f64>() / n;
-            println!(
-                "  {:>6.2} | {:>8.2} | {:>16.2} | {:>12.1}",
-                ct, rt, avg_count_error, avg_accuracy
-            );
+    if cli.skip_threshold_grid {
+        println!("(riepilogo soglia-per-soglia saltato: --skip-threshold-grid)\n");
+    } else {
+        println!("=== Aggregato per combinazione di soglie (media su {} registrazioni) ===", recordings.len());
+        println!(
+            "  {:>6} | {:>8} | {:>16} | {:>12}",
+            "clust", "reattach", "avg |detected-true|", "avg turn acc %"
+        );
+        for &ct in &clustering_thresholds {
+            for &rt in &reattach_thresholds {
+                let matching: Vec<&GridResult> = all_results
+                    .iter()
+                    .map(|(_, r)| r)
+                    .filter(|r| r.clustering_threshold == ct && r.reattach_threshold == rt)
+                    .collect();
+                let n = matching.len() as f64;
+                let avg_count_error: f64 = matching
+                    .iter()
+                    .map(|r| (r.detected_speaker_count as f64 - r.true_speaker_count as f64).abs())
+                    .sum::<f64>()
+                    / n;
+                let avg_accuracy: f64 = matching.iter().map(|r| r.turn_accuracy_pct).sum::<f64>() / n;
+                println!(
+                    "  {:>6.2} | {:>8.2} | {:>16.2} | {:>12.1}",
+                    ct, rt, avg_count_error, avg_accuracy
+                );
+            }
         }
     }
 
     println!(
-        "\n=== Spettrale (max_speakers={}), media su {} registrazioni ===",
-        cli.max_speakers,
+        "\n=== Spettrale (max_speakers={}), dettaglio per registrazione ===",
+        cli.max_speakers
+    );
+    println!(
+        "  {:>30} | {:>6} | {:>9} | {:>9} | {:>12}",
+        "registrazione", "p", "detected", "true", "turn acc %"
+    );
+    for (name, p_label, detected, truth, accuracy) in &spectral_results {
+        println!(
+            "  {:>30} | {:>6} | {:>9} | {:>9} | {:>12.1}",
+            name, p_label, detected, truth, accuracy
+        );
+    }
+
+    // Aggregate per p value tried, in first-seen order -- lets a --nearest-neighbors
+    // sweep be compared side by side without re-running the tool once per value.
+    let mut seen_p_labels: Vec<String> = Vec::new();
+    for (_, p_label, ..) in &spectral_results {
+        if !seen_p_labels.contains(p_label) {
+            seen_p_labels.push(p_label.clone());
+        }
+    }
+    println!(
+        "\n=== Spettrale, aggregato per valore di p (media su {} registrazioni) ===",
         recordings.len()
     );
-    println!("  {:>30} | {:>9} | {:>9} | {:>12}", "registrazione", "detected", "true", "turn acc %");
-    for (name, detected, truth, accuracy) in &spectral_results {
-        println!("  {:>30} | {:>9} | {:>9} | {:>12.1}", name, detected, truth, accuracy);
+    println!("  {:>6} | {:>16} | {:>12}", "p", "avg |detected-true|", "avg turn acc %");
+    for p_label in &seen_p_labels {
+        let matching: Vec<&(String, String, usize, usize, f64)> = spectral_results
+            .iter()
+            .filter(|(_, p, ..)| p == p_label)
+            .collect();
+        let n = matching.len() as f64;
+        let avg_count_error: f64 = matching
+            .iter()
+            .map(|(_, _, d, t, _)| (*d as f64 - *t as f64).abs())
+            .sum::<f64>()
+            / n;
+        let avg_accuracy: f64 = matching.iter().map(|(_, _, _, _, a)| a).sum::<f64>() / n;
+        println!("  {:>6} | {:>16.2} | {:>12.1}", p_label, avg_count_error, avg_accuracy);
     }
-    let n_spectral = spectral_results.len() as f64;
-    let spectral_avg_count_error: f64 = spectral_results
-        .iter()
-        .map(|(_, d, t, _)| (*d as f64 - *t as f64).abs())
-        .sum::<f64>()
-        / n_spectral;
-    let spectral_avg_accuracy: f64 =
-        spectral_results.iter().map(|(_, _, _, a)| a).sum::<f64>() / n_spectral;
-    println!(
-        "  {:>30} | avg |detected-true| {:>6.2} | avg turn acc {:>5.1}%",
-        "AGGREGATO", spectral_avg_count_error, spectral_avg_accuracy
-    );
 
     Ok(())
 }

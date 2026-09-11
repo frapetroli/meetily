@@ -19,8 +19,8 @@
 //! `clustering::cluster_embeddings` (see `finalize()`).
 
 use crate::diarization::clustering::{
-    cluster_embeddings, cluster_embeddings_spectral, normalize_labels, reattach_small_clusters,
-    DEFAULT_CLUSTERING_THRESHOLD, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD,
+    cluster_embeddings, cluster_embeddings_spectral_with_p, normalize_labels,
+    reattach_small_clusters, DEFAULT_CLUSTERING_THRESHOLD, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD,
 };
 use crate::diarization::merge::SpeakerSegment;
 use sherpa_onnx::{
@@ -228,12 +228,25 @@ impl DiarizationEngine {
     /// cluster count via `max_speakers`, unlike the threshold method's cluster count,
     /// which the reattach pass exists to rein in.
     pub fn finalize_with_spectral(&self, max_speakers: usize) -> Vec<SpeakerSegment> {
+        self.finalize_with_spectral_and_p(max_speakers, None)
+    }
+
+    /// Same as `finalize_with_spectral`, but lets the caller override the p-nearest-
+    /// neighbor pruning count (see `clustering::cluster_embeddings_spectral_with_p`) --
+    /// exists for `examples/diarization_calibration.rs` to experiment with `p` on real
+    /// recordings where the default formula under-estimated the speaker count. `None`
+    /// reproduces `finalize_with_spectral`'s exact behavior.
+    pub fn finalize_with_spectral_and_p(
+        &self,
+        max_speakers: usize,
+        p_override: Option<usize>,
+    ) -> Vec<SpeakerSegment> {
         if self.accumulated.is_empty() {
             return Vec::new();
         }
 
         let embeddings: Vec<Vec<f32>> = self.accumulated.iter().map(|(e, _, _)| e.clone()).collect();
-        let labels = cluster_embeddings_spectral(&embeddings, max_speakers);
+        let labels = cluster_embeddings_spectral_with_p(&embeddings, max_speakers, p_override);
         let labels = normalize_labels(&labels);
 
         let mut segments: Vec<SpeakerSegment> = self

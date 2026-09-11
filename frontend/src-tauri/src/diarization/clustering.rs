@@ -382,6 +382,22 @@ fn kmeans(points: &[Vec<f64>], k: usize) -> Vec<usize> {
 /// `cluster_embeddings`, drops into the same downstream pipeline (`normalize_labels`,
 /// `SpeakerSegment` construction) unchanged.
 pub fn cluster_embeddings_spectral(embeddings: &[Vec<f32>], max_speakers: usize) -> Vec<usize> {
+    cluster_embeddings_spectral_with_p(embeddings, max_speakers, None)
+}
+
+/// Same as `cluster_embeddings_spectral`, but lets the caller override the p-nearest-
+/// neighbor pruning count instead of always using `nearest_neighbor_count`'s `ln(n)+1`
+/// formula. Exists for `examples/diarization_calibration.rs` to experiment with `p` on
+/// real recordings (the two hardest calibration files, with more true speakers, under-
+/// estimated the speaker count with the default formula -- see docs/sviluppi/diarization/
+/// Architettura pipeline.md, "Primo confronto reale..." -- a larger `p` is one plausible
+/// fix, to be validated empirically like everything else in this file, not assumed).
+/// `None` reproduces the exact default-formula behavior of `cluster_embeddings_spectral`.
+pub fn cluster_embeddings_spectral_with_p(
+    embeddings: &[Vec<f32>],
+    max_speakers: usize,
+    p_override: Option<usize>,
+) -> Vec<usize> {
     let n = embeddings.len();
     if n == 0 {
         return Vec::new();
@@ -422,7 +438,9 @@ pub fn cluster_embeddings_spectral(embeddings: &[Vec<f32>], max_speakers: usize)
         }
     }
 
-    let p = nearest_neighbor_count(n);
+    let p = p_override
+        .unwrap_or_else(|| nearest_neighbor_count(n))
+        .clamp(2, n.saturating_sub(1).max(2));
     let mut affinity_final = prune_to_p_nearest_neighbors(&affinity, p);
 
     let mut degree = vec![0.0f64; n];
@@ -782,5 +800,36 @@ mod tests {
             1,
             "collapses to 1 here -- see comment above"
         );
+    }
+
+    #[test]
+    fn spectral_with_p_none_matches_the_default_formula() {
+        // cluster_embeddings_spectral must be exactly cluster_embeddings_spectral_with_p
+        // with p_override=None -- a regression guard on the delegation itself, not on the
+        // algorithm (already covered by the tests above).
+        let a = vec![1.0, 0.0];
+        let b = vec![0.0, 1.0];
+        let embeddings = vec![a.clone(), a.clone(), a, b.clone(), b.clone(), b];
+        let via_default = cluster_embeddings_spectral(&embeddings, 5);
+        let via_explicit_none = cluster_embeddings_spectral_with_p(&embeddings, 5, None);
+        assert_eq!(via_default, via_explicit_none);
+    }
+
+    #[test]
+    fn spectral_with_p_override_clamps_without_panicking() {
+        // Extreme p_override values (0, and far beyond n) must clamp instead of panicking
+        // -- exact resulting labels aren't asserted here (unlike the hand-verified tests
+        // above, changing p can change the graph structure in ways not worth re-deriving
+        // by hand for this regression guard), only that the function stays well-behaved.
+        let a = vec![1.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0];
+        let c = vec![0.0, 0.0, 1.0];
+        let embeddings = vec![a.clone(), a, b.clone(), b, c.clone(), c];
+
+        let low = cluster_embeddings_spectral_with_p(&embeddings, 5, Some(0));
+        assert_eq!(low.len(), embeddings.len());
+
+        let high = cluster_embeddings_spectral_with_p(&embeddings, 5, Some(1000));
+        assert_eq!(high.len(), embeddings.len());
     }
 }
