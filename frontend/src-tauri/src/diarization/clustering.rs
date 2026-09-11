@@ -987,11 +987,11 @@ mod tests {
         // group is ~0.05-0.15 -- a clear, non-adversarial separation.
         let mut embeddings = Vec::with_capacity(16);
         for i in 0..8 {
-            let f = i as f64;
+            let f = i as f32;
             embeddings.push(vec![1.0, 0.05 + 0.01 * f, 0.02]);
         }
         for i in 0..8 {
-            let f = i as f64;
+            let f = i as f32;
             embeddings.push(vec![0.02, 1.0, 0.05 + 0.01 * f]);
         }
         let labels = cluster_embeddings_spectral(&embeddings, 10);
