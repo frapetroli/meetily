@@ -13,6 +13,9 @@
 //! override it.
 
 use nalgebra::{DMatrix, SymmetricEigen};
+use rand::distributions::{Distribution, WeightedIndex};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 pub const DEFAULT_CLUSTERING_THRESHOLD: f32 = 0.6;
 
@@ -260,12 +263,17 @@ pub fn normalize_labels(labels: &[usize]) -> Vec<usize> {
 //   `norm_laplacian=False`) -- the first attempt added a Ng-Jordan-Weiss
 //   row-normalization step the reference does not use; removed for fidelity.
 //
-// Deliberate, documented deviation kept from the first attempt: k-means (see `kmeans`
-// below) uses a deterministic "farthest-first" initialization and a single run, not
-// scikit-learn's `KMeans(n_init=10)` (10 random restarts) that the reference uses --
-// determinism was worth more than matching this specific detail, given there is no
+// K-means (see `kmeans` below) now matches the reference's `n_init=10` -- 10 restarts
+// with k-means++ initialization (the reference's own default), picking the run with the
+// lowest inertia, same selection rule scikit-learn uses. The one remaining deliberate
+// deviation: the reference's restarts are unseeded (genuinely random), ours use fixed
+// seeds 0..9, so the result stays exactly reproducible run-to-run -- there is no
 // compiler available in the sandbox this was written in to catch a randomness-related
-// bug before it reaches a real machine.
+// bug before it reaches a real machine. The original single deterministic "farthest-
+// first" run from this file's first version of `kmeans` is kept as an extra 11th
+// candidate alongside the 10 seeded restarts (not a reference behavior -- our own
+// addition), so this change can only match or improve on the previous behavior, never
+// regress it.
 //
 // Honest testing caveat (see the test module): the exact hand-derived eigenvalues used
 // to verify this file's first attempt do not transfer cleanly to this version. Two real
@@ -439,8 +447,11 @@ fn nme_select_p(similarity: &[Vec<f64>], max_speakers: usize) -> usize {
     } else {
         (0..candidate_count)
             .map(|i| {
+                // Reference: `np.linspace(...).astype(int)` truncates toward zero, it does
+                // not round to the nearest integer -- `as usize` on a positive f64 already
+                // truncates the same way, so no explicit `.round()`/`.floor()` call is needed.
                 let t = i as f64 / (candidate_count - 1) as f64;
-                (1.0 + t * (max_n as f64 - 1.0)).round() as usize
+                (1.0 + t * (max_n as f64 - 1.0)) as usize
             })
             .collect()
     };
@@ -482,24 +493,17 @@ fn nme_select_p(similarity: &[Vec<f64>], max_speakers: usize) -> usize {
     best_p
 }
 
-/// Lloyd's k-means on already-embedded points (deterministic "farthest-first" init, no
-/// random restarts -- deliberate: with N/K both small here (spectral embeddings of a
-/// few hundred segments into under ~20 dimensions at most), a single deterministic run
-/// is both fast enough and, crucially, exactly reproducible for hand-verified unit
-/// tests. Farthest-first is also a good fit for this specific input: row-normalized
-/// spectral embeddings tend to already be well-separated per true cluster, so greedily
-/// seeding one center per far-apart point reliably lands one seed per cluster.
-fn kmeans(points: &[Vec<f64>], k: usize) -> Vec<usize> {
-    let n = points.len();
-    if k <= 1 || n <= 1 {
-        return vec![0; n];
-    }
-    let dim = points[0].len();
+fn sq_dist(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+}
 
-    fn sq_dist(a: &[f64], b: &[f64]) -> f64 {
-        a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
-    }
-
+/// Deterministic "farthest-first" seeding: kept from this file's first version of
+/// `kmeans`, now used as one extra candidate alongside the seeded k-means++ restarts
+/// below (see `kmeans`'s doc comment). Greedily picks, after an arbitrary first center,
+/// whichever remaining point is farthest from every center chosen so far -- a good fit
+/// for row-normalized spectral embeddings, which tend to already be well-separated per
+/// true cluster.
+fn farthest_first_init(points: &[Vec<f64>], k: usize) -> Vec<Vec<f64>> {
     let mut centers: Vec<Vec<f64>> = vec![points[0].clone()];
     let mut min_dist: Vec<f64> = points.iter().map(|p| sq_dist(p, &centers[0])).collect();
     while centers.len() < k {
@@ -514,6 +518,45 @@ fn kmeans(points: &[Vec<f64>], k: usize) -> Vec<usize> {
             min_dist[i] = min_dist[i].min(sq_dist(p, &centers[last]));
         }
     }
+    centers
+}
+
+/// k-means++ seeding (the reference's/scikit-learn's default `KMeans` initialization):
+/// first center uniformly random, each subsequent center picked with probability
+/// proportional to its squared distance from the nearest already-chosen center --
+/// spreads the initial centers out, rather than risking several landing in the same
+/// true cluster the way a purely uniform random pick could.
+fn kmeanspp_init(points: &[Vec<f64>], k: usize, rng: &mut StdRng) -> Vec<Vec<f64>> {
+    let n = points.len();
+    let mut centers: Vec<Vec<f64>> = vec![points[rng.gen_range(0..n)].clone()];
+    let mut min_dist: Vec<f64> = points.iter().map(|p| sq_dist(p, &centers[0])).collect();
+    while centers.len() < k {
+        let total: f64 = min_dist.iter().sum();
+        let next = if total <= 0.0 {
+            // All remaining points exactly coincide with an existing center (degenerate
+            // input, e.g. duplicate embeddings) -- weighted sampling can't break the tie,
+            // fall back to picking uniformly at random.
+            rng.gen_range(0..n)
+        } else {
+            WeightedIndex::new(&min_dist)
+                .expect("total > 0 checked above, so at least one weight is positive")
+                .sample(rng)
+        };
+        centers.push(points[next].clone());
+        let last = centers.len() - 1;
+        for (i, p) in points.iter().enumerate() {
+            min_dist[i] = min_dist[i].min(sq_dist(p, &centers[last]));
+        }
+    }
+    centers
+}
+
+/// Lloyd's algorithm from a given set of initial centers. Returns the final assignment
+/// plus its inertia (sum of squared point-to-assigned-center distances) -- the same
+/// quantity scikit-learn's `KMeans(n_init=...)` uses to pick the best of several runs.
+fn lloyd_iterate(points: &[Vec<f64>], k: usize, mut centers: Vec<Vec<f64>>) -> (Vec<usize>, f64) {
+    let n = points.len();
+    let dim = points[0].len();
 
     const KMEANS_MAX_ITERS: usize = 100;
     let mut assignment = vec![0usize; n];
@@ -558,7 +601,40 @@ fn kmeans(points: &[Vec<f64>], k: usize) -> Vec<usize> {
             break;
         }
     }
-    assignment
+
+    let inertia: f64 = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| sq_dist(p, &centers[assignment[i]]))
+        .sum();
+    (assignment, inertia)
+}
+
+/// Reference: scikit-learn `KMeans(n_init=10)` -- 10 restarts, keep the one with the
+/// lowest inertia. See the module-level comment above for the one deliberate deviation
+/// (fixed seeds instead of the reference's genuine randomness) and the extra 11th
+/// candidate kept from this file's first version.
+const KMEANS_N_INIT: usize = 10;
+
+fn kmeans(points: &[Vec<f64>], k: usize) -> Vec<usize> {
+    let n = points.len();
+    if k <= 1 || n <= 1 {
+        return vec![0; n];
+    }
+
+    let (mut best_assignment, mut best_inertia) =
+        lloyd_iterate(points, k, farthest_first_init(points, k));
+
+    for seed in 0..KMEANS_N_INIT as u64 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let (assignment, inertia) = lloyd_iterate(points, k, kmeanspp_init(points, k, &mut rng));
+        if inertia < best_inertia {
+            best_inertia = inertia;
+            best_assignment = assignment;
+        }
+    }
+
+    best_assignment
 }
 
 /// Spectral clustering with automatic speaker-count estimation. See the module-level
