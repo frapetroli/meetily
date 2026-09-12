@@ -643,7 +643,7 @@ fn kmeans(points: &[Vec<f64>], k: usize) -> Vec<usize> {
 /// not a tight guess: if the true cluster count is at or beyond the cap, the eigengap
 /// search can collapse the estimate well below the cap rather than simply clipping to it
 /// (see the doc comment on the K-estimation loop below, and the
-/// `spectral_true_k_exceeding_max_speakers_never_exceeds_the_cap` test).
+/// `k_from_gaps_capping_does_not_simply_clip_to_the_cap` test).
 ///
 /// Returns one 0-indexed cluster label per input embedding -- same contract as
 /// `cluster_embeddings`, drops into the same downstream pipeline (`normalize_labels`,

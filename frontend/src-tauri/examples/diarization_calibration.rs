@@ -64,10 +64,13 @@ struct Cli {
 
     /// Comma-separated list of p-nearest-neighbor pruning counts to try with the spectral
     /// method (see `cluster_embeddings_spectral_with_p`), instead of always using its
-    /// default `ln(n)+1` formula. Omit to run once with the default formula only. Useful
-    /// for experimenting on recordings where the default formula under- or over-estimates
-    /// the speaker count -- see docs/sviluppi/diarization/Architettura pipeline.md, "Primo
-    /// confronto reale...". Example: `--nearest-neighbors 10,15,25`.
+    /// default per-recording NME auto-search (`nme_select_p`, in `clustering.rs`). Omit to
+    /// run once with the auto-search only. Useful for experimenting on recordings where
+    /// the auto-search under- or over-estimates the speaker count -- see
+    /// docs/sviluppi/diarization/Architettura pipeline.md, "Primo confronto reale...",
+    /// "Tentativo di fix: p fisso...". A fixed p was tried and found not to generalize
+    /// across recordings of different sizes -- see that same doc. Example:
+    /// `--nearest-neighbors 10,15,25`.
     #[arg(long)]
     nearest_neighbors: Option<String>,
 
@@ -340,7 +343,8 @@ fn main() -> Result<()> {
     let clustering_thresholds = parse_threshold_list(&cli.clustering_thresholds)?;
     let reattach_thresholds = parse_threshold_list(&cli.reattach_thresholds)?;
     // One entry per p value to try with the spectral method; `None` means "use the
-    // default ln(n)+1 formula". Absent --nearest-neighbors -> a single default-only run.
+    // default per-recording NME auto-search". Absent --nearest-neighbors -> a single
+    // default-only run.
     let p_values: Vec<Option<usize>> = match &cli.nearest_neighbors {
         Some(s) => parse_usize_list(s)?.into_iter().map(Some).collect(),
         None => vec![None],
@@ -427,8 +431,8 @@ fn main() -> Result<()> {
         // Experimental spectral method -- same already-accumulated embeddings, no second
         // ONNX inference pass. Printed separately since it isn't part of the
         // threshold/reattach grid (it has its own parameters, max_speakers/nearest_neighbors).
-        // One run per p value in p_values (just [None] -- the default formula -- if
-        // --nearest-neighbors was omitted).
+        // One run per p value in p_values (just [None] -- the default NME auto-search --
+        // if --nearest-neighbors was omitted).
         for &p_override in &p_values {
             let spectral_segments = engine.finalize_with_spectral_and_p(cli.max_speakers, p_override);
             let spectral_detected = distinct_speaker_count(&spectral_segments);
