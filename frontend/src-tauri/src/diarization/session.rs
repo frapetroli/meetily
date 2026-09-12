@@ -30,6 +30,7 @@ impl DiarizationSession {
         segmentation_model_path: String,
         embedding_model_path: String,
         num_threads: i32,
+        max_speakers: usize,
     ) -> Result<Self, DiarizationEngineError> {
         let mut engine = DiarizationEngine::new(&segmentation_model_path, &embedding_model_path, num_threads)?;
         let expected_sample_rate = engine.sample_rate();
@@ -116,8 +117,10 @@ impl DiarizationSession {
 
             // `finalize()` runs the final clustering pass -- not ONNX inference, but
             // still synchronous CPU work over all accumulated embeddings; spawn_blocking
-            // for the same reason as process_chunk above.
-            tokio::task::spawn_blocking(move || engine.finalize())
+            // for the same reason as process_chunk above. `max_speakers` needs no
+            // round-trip (unlike `engine`/`window` above): nothing downstream needs it
+            // back, so a plain `move` capture is enough.
+            tokio::task::spawn_blocking(move || engine.finalize(max_speakers))
                 .await
                 .expect("diarization finalize blocking task panicked")
         });
@@ -153,11 +156,11 @@ impl DiarizationSession {
         app: &tauri::AppHandle<R>,
     ) -> Result<Option<Self>, String> {
         let paths = crate::diarization::model::resolve_paths_if_enabled(app).await?;
-        let Some((segmentation_model_path, embedding_model_path)) = paths else {
+        let Some((segmentation_model_path, embedding_model_path, max_speakers)) = paths else {
             return Ok(None);
         };
 
-        let session = Self::start(segmentation_model_path, embedding_model_path, 1)
+        let session = Self::start(segmentation_model_path, embedding_model_path, 1, max_speakers)
             .map_err(|e| format!("Failed to initialize diarization engine: {}", e))?;
 
         Ok(Some(session))

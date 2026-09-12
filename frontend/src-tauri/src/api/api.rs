@@ -716,6 +716,32 @@ pub async fn api_save_diarization_enabled<R: Runtime>(
         .map_err(|e| e.to_string())
 }
 
+/// Upper bound on the number of speakers the spectral clustering method (NME-SC) may
+/// estimate (ADR-0024), default `clustering::DEFAULT_MAX_SPEAKERS` (20). Same
+/// deliberately-separate pattern as `api_get_diarization_enabled` above.
+#[tauri::command]
+pub async fn api_get_diarization_max_speakers<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    let pool = state.db_manager.pool();
+    SettingsRepository::get_diarization_max_speakers(pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn api_save_diarization_max_speakers<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    max_speakers: usize,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    SettingsRepository::save_diarization_max_speakers(pool, max_speakers)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn api_get_transcript_api_key<R: Runtime>(
     _app: AppHandle<R>,

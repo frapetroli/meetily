@@ -1,19 +1,16 @@
 //! Diagnostic tool (not shipped app behavior): runs the real diarization pipeline
 //! (`app_lib::diarization::DiarizationEngine`) against real recordings and compares the
-//! result to a known reference transcript, across a grid of clustering/reattach
-//! thresholds -- same methodology as the original "Blocker 2" calibration table in
-//! `docs/sviluppi/diarization/Roadmap e todo.md` (outside this repo), but on real
-//! multi-speaker Italian recordings instead of 4 clean/synthetic samples.
+//! spectral/NME-SC clustering result (the production method, ADR-0024) to a known
+//! reference transcript.
 //!
-//! Expensive ONNX inference (`process_chunk`) runs exactly once per recording; the grid
-//! sweep then only re-runs `DiarizationEngine::finalize_with_thresholds` (cheap
-//! clustering) per grid point against the same accumulated embeddings.
+//! Expensive ONNX inference (`process_chunk`) runs exactly once per recording; clustering
+//! itself (`finalize_with_spectral_and_p`) is cheap and re-run per `--nearest-neighbors`
+//! value against the same accumulated embeddings.
 //!
 //! Usage:
 //!   cargo run --release --example diarization_calibration -- \
 //!     --data-dir <path> --models-dir <path> \
-//!     [--clustering-thresholds 0.5,0.55,0.6,0.65,0.7] \
-//!     [--reattach-thresholds 0.35,0.40,0.45,0.50]
+//!     [--max-speakers 20] [--nearest-neighbors 10,15,25]
 //!
 //! `--data-dir` can also come from the `MEETILY_CALIBRATION_DIR` env var.
 //!
@@ -27,7 +24,6 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use app_lib::audio::decoder::decode_audio_file;
-use app_lib::diarization::clustering::MIN_CLUSTER_SIZE;
 use app_lib::diarization::{DiarizationEngine, SpeakerSegment};
 use clap::Parser;
 use regex::Regex;
@@ -35,7 +31,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
-#[command(about = "Sweep diarization clustering/reattach thresholds against real recordings")]
+#[command(about = "Calibrate the spectral/NME-SC diarization clustering against real recordings")]
 struct Cli {
     /// Folder with one subfolder per recording (audio file + reference.txt). Falls back
     /// to MEETILY_CALIBRATION_DIR if omitted.
@@ -47,15 +43,7 @@ struct Cli {
     #[arg(long)]
     models_dir: PathBuf,
 
-    /// Comma-separated list of DEFAULT_CLUSTERING_THRESHOLD values to try.
-    #[arg(long, default_value = "0.5,0.55,0.6,0.65,0.7")]
-    clustering_thresholds: String,
-
-    /// Comma-separated list of REATTACH_THRESHOLD values to try.
-    #[arg(long, default_value = "0.35,0.40,0.45,0.50")]
-    reattach_thresholds: String,
-
-    /// Upper bound passed to the experimental spectral-clustering method
+    /// Upper bound passed to the spectral-clustering method
     /// (`DiarizationEngine::finalize_with_spectral`). Pass a generous value, not a tight
     /// guess at the real speaker count -- see `cluster_embeddings_spectral`'s doc comment
     /// on why capping too tightly can collapse the estimate well below the cap.
@@ -73,15 +61,6 @@ struct Cli {
     /// `--nearest-neighbors 10,15,25`.
     #[arg(long)]
     nearest_neighbors: Option<String>,
-
-    /// Skip the threshold/reattach grid entirely (and its aggregate table), running only
-    /// the spectral method. The expensive part -- decoding + ONNX segmentation/embedding
-    /// -- happens once regardless and is shared by both methods, so this does NOT skip
-    /// that; it only skips the (non-trivial, especially on longer recordings with more
-    /// accumulated segments) threshold-clustering grid, which the spectral method doesn't
-    /// need. Useful when iterating on --nearest-neighbors and re-running repeatedly.
-    #[arg(long, default_value_t = false)]
-    skip_threshold_grid: bool,
 }
 
 struct GroundTruthTurn {
@@ -94,24 +73,6 @@ struct Recording {
     name: String,
     audio_path: PathBuf,
     reference_path: PathBuf,
-}
-
-struct GridResult {
-    clustering_threshold: f32,
-    reattach_threshold: f32,
-    detected_speaker_count: usize,
-    true_speaker_count: usize,
-    turn_accuracy_pct: f64,
-}
-
-fn parse_threshold_list(s: &str) -> Result<Vec<f32>> {
-    s.split(',')
-        .map(|part| {
-            part.trim()
-                .parse::<f32>()
-                .with_context(|| format!("invalid threshold value: {part:?}"))
-        })
-        .collect()
 }
 
 fn parse_usize_list(s: &str) -> Result<Vec<usize>> {
@@ -340,8 +301,6 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("--data-dir not given and MEETILY_CALIBRATION_DIR not set"))?;
     assert_data_dir_outside_repo(&data_dir)?;
 
-    let clustering_thresholds = parse_threshold_list(&cli.clustering_thresholds)?;
-    let reattach_thresholds = parse_threshold_list(&cli.reattach_thresholds)?;
     // One entry per p value to try with the spectral method; `None` means "use the
     // default per-recording NME auto-search". Absent --nearest-neighbors -> a single
     // default-only run.
@@ -369,7 +328,6 @@ fn main() -> Result<()> {
     }
     println!("Found {} recording(s) to calibrate against.\n", recordings.len());
 
-    let mut all_results: Vec<(String, GridResult)> = Vec::new();
     let mut spectral_results: Vec<(String, String, usize, usize, f64)> = Vec::new(); // (name, p_label, detected, true, accuracy)
 
     for recording in &recordings {
@@ -398,39 +356,6 @@ fn main() -> Result<()> {
             .process_chunk(&samples, 0.0)
             .map_err(|e| anyhow!("process_chunk failed: {e}"))?;
 
-        if cli.skip_threshold_grid {
-            println!("  (griglia soglia-per-soglia saltata: --skip-threshold-grid)");
-        } else {
-            println!(
-                "  {:>6} | {:>8} | {:>9} | {:>9} | {:>12}",
-                "clust", "reattach", "detected", "true", "turn acc %"
-            );
-            for &ct in &clustering_thresholds {
-                for &rt in &reattach_thresholds {
-                    let segments = engine.finalize_with_thresholds(ct, MIN_CLUSTER_SIZE, rt);
-                    let detected = distinct_speaker_count(&segments);
-                    let accuracy = score_against_ground_truth(&segments, &ground_truth);
-                    println!(
-                        "  {:>6.2} | {:>8.2} | {:>9} | {:>9} | {:>12.1}",
-                        ct, rt, detected, true_speaker_count, accuracy
-                    );
-                    all_results.push((
-                        recording.name.clone(),
-                        GridResult {
-                            clustering_threshold: ct,
-                            reattach_threshold: rt,
-                            detected_speaker_count: detected,
-                            true_speaker_count,
-                            turn_accuracy_pct: accuracy,
-                        },
-                    ));
-                }
-            }
-        }
-
-        // Experimental spectral method -- same already-accumulated embeddings, no second
-        // ONNX inference pass. Printed separately since it isn't part of the
-        // threshold/reattach grid (it has its own parameters, max_speakers/nearest_neighbors).
         // One run per p value in p_values (just [None] -- the default NME auto-search --
         // if --nearest-neighbors was omitted).
         for &p_override in &p_values {
@@ -452,36 +377,6 @@ fn main() -> Result<()> {
         }
 
         println!();
-    }
-
-    if cli.skip_threshold_grid {
-        println!("(riepilogo soglia-per-soglia saltato: --skip-threshold-grid)\n");
-    } else {
-        println!("=== Aggregato per combinazione di soglie (media su {} registrazioni) ===", recordings.len());
-        println!(
-            "  {:>6} | {:>8} | {:>16} | {:>12}",
-            "clust", "reattach", "avg |detected-true|", "avg turn acc %"
-        );
-        for &ct in &clustering_thresholds {
-            for &rt in &reattach_thresholds {
-                let matching: Vec<&GridResult> = all_results
-                    .iter()
-                    .map(|(_, r)| r)
-                    .filter(|r| r.clustering_threshold == ct && r.reattach_threshold == rt)
-                    .collect();
-                let n = matching.len() as f64;
-                let avg_count_error: f64 = matching
-                    .iter()
-                    .map(|r| (r.detected_speaker_count as f64 - r.true_speaker_count as f64).abs())
-                    .sum::<f64>()
-                    / n;
-                let avg_accuracy: f64 = matching.iter().map(|r| r.turn_accuracy_pct).sum::<f64>() / n;
-                println!(
-                    "  {:>6.2} | {:>8.2} | {:>16.2} | {:>12.1}",
-                    ct, rt, avg_count_error, avg_accuracy
-                );
-            }
-        }
     }
 
     println!(

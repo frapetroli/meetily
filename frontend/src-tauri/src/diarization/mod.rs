@@ -31,7 +31,7 @@ pub mod merge;
 pub mod model;
 pub mod session;
 
-pub use clustering::{cluster_embeddings, cluster_embeddings_spectral, cluster_embeddings_spectral_with_p};
+pub use clustering::{cluster_embeddings_spectral, cluster_embeddings_spectral_with_p};
 pub use commands::{diarization_download_models, diarization_get_status};
 pub use engine::{DiarizationEngine, DiarizationEngineError};
 pub use merge::{

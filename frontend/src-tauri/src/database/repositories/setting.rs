@@ -205,6 +205,43 @@ impl SettingsRepository {
         Ok(())
     }
 
+    /// Upper bound on the number of speakers the spectral clustering method (NME-SC) may
+    /// estimate for a call (see `docs/adr/0024-...md`), default
+    /// `clustering::DEFAULT_MAX_SPEAKERS` (20). Same dedicated-query pattern as
+    /// `get_diarization_enabled` above, for the same reason (kept out of
+    /// `TranscriptSetting`/`get_transcript_config()`).
+    pub async fn get_diarization_max_speakers(pool: &SqlitePool) -> std::result::Result<usize, sqlx::Error> {
+        let max_speakers: Option<i64> = sqlx::query_scalar(
+            "SELECT diarization_max_speakers FROM transcript_settings WHERE id = '1' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await?;
+        Ok(max_speakers
+            .and_then(|v| usize::try_from(v).ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(crate::diarization::clustering::DEFAULT_MAX_SPEAKERS))
+    }
+
+    pub async fn save_diarization_max_speakers(
+        pool: &SqlitePool,
+        max_speakers: usize,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO transcript_settings (id, provider, model, diarization_max_speakers)
+            VALUES ('1', 'parakeet', $1, $2)
+            ON CONFLICT(id) DO UPDATE SET
+                diarization_max_speakers = excluded.diarization_max_speakers
+            "#,
+        )
+        .bind(crate::config::DEFAULT_PARAKEET_MODEL)
+        .bind(max_speakers as i64)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn save_transcript_api_key(
         pool: &SqlitePool,
         provider: &str,

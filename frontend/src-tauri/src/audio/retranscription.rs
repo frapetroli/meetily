@@ -238,7 +238,7 @@ async fn run_retranscription<R: Runtime>(
         .await
         .map_err(|e| anyhow!(e))?;
     let diarization_enabled = diarization_paths.is_some();
-    let diarization_task = diarization_paths.map(|(segmentation_model_path, embedding_model_path)| {
+    let diarization_task = diarization_paths.map(|(segmentation_model_path, embedding_model_path, max_speakers)| {
         let audio_for_diarization = audio_samples.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<SpeakerSegment>> {
             // Same lock used around Whisper/Parakeet engine lifecycle (audio/common.rs) and
@@ -252,7 +252,7 @@ async fn run_retranscription<R: Runtime>(
             engine
                 .process_chunk(&audio_for_diarization, 0.0)
                 .map_err(|e| anyhow!("Diarization processing failed: {}", e))?;
-            Ok(engine.finalize())
+            Ok(engine.finalize(max_speakers))
         })
     });
 

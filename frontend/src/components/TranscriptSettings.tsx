@@ -49,6 +49,9 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [diarizationDownloadPercent, setDiarizationDownloadPercent] = useState<number>(0);
     const [isDiarizationDownloading, setIsDiarizationDownloading] = useState<boolean>(false);
     const [diarizationDownloadError, setDiarizationDownloadError] = useState<string | null>(null);
+    // Upper bound passed to the spectral clustering method (NME-SC, ADR-0024), default 20
+    // -- see api_get/save_diarization_max_speakers. Saved on blur, not per-keystroke.
+    const [maxSpeakers, setMaxSpeakers] = useState<number>(20);
 
     const refreshDiarizationModelStatus = async () => {
         try {
@@ -109,6 +112,9 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         invoke<boolean>('api_get_diarization_enabled')
             .then(setDiarizationEnabled)
             .catch((err) => console.error('Error fetching diarization_enabled:', err));
+        invoke<number>('api_get_diarization_max_speakers')
+            .then(setMaxSpeakers)
+            .catch((err) => console.error('Error fetching diarization_max_speakers:', err));
     }, []);
 
     const handleDiarizationToggle = async (checked: boolean) => {
@@ -122,6 +128,16 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
             setDiarizationEnabled(previous); // revert on failure
         } finally {
             setIsDiarizationToggleBusy(false);
+        }
+    };
+
+    const handleMaxSpeakersBlur = async (rawValue: string) => {
+        const parsed = Math.max(2, Math.round(Number(rawValue)) || 20);
+        setMaxSpeakers(parsed);
+        try {
+            await invoke('api_save_diarization_max_speakers', { maxSpeakers: parsed });
+        } catch (err) {
+            console.error('Error saving diarization_max_speakers:', err);
         }
     };
 
@@ -360,6 +376,26 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                         </Button>
                                     </div>
                                 )}
+
+                                <div className="mt-3 pt-3 border-t border-gray-200 flex items-center justify-between gap-3">
+                                    <div className="pr-4">
+                                        <Label className="block text-xs font-medium text-gray-700">
+                                            Max expected speakers
+                                        </Label>
+                                        <p className="text-xs text-gray-500 mt-0.5">
+                                            Upper bound for the speaker-count estimate. Generous is better than
+                                            tight -- it does not force this many speakers, only caps the estimate.
+                                        </p>
+                                    </div>
+                                    <Input
+                                        type="number"
+                                        min={2}
+                                        value={maxSpeakers}
+                                        onChange={(e) => setMaxSpeakers(Number(e.target.value))}
+                                        onBlur={(e) => handleMaxSpeakersBlur(e.target.value)}
+                                        className="w-20 shrink-0"
+                                    />
+                                </div>
                             </div>
                         )}
                     </div>

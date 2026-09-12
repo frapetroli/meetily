@@ -645,6 +645,8 @@ pub fn run() {
             api::api_save_transcript_config,
             api::api_get_diarization_enabled,
             api::api_save_diarization_enabled,
+            api::api_get_diarization_max_speakers,
+            api::api_save_diarization_max_speakers,
             diarization::commands::diarization_get_status,
             diarization::commands::diarization_download_models,
             api::api_get_transcript_api_key,

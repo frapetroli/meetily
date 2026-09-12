@@ -2,8 +2,8 @@
 //! `assign_word_speakers` style, as used by WhisperX). Pure functions, no I/O -- the
 //! word/timestamp side comes from the already-active ASR engine (Whisper-rs or Parakeet,
 //! extended per ADR-0013 to propagate per-word timestamps), the speaker-segment side
-//! comes from `diarization::clustering::cluster_embeddings` grouped back into
-//! `(start, end, speaker)` spans by `engine.rs`.
+//! comes from `diarization::clustering`'s spectral clustering (ADR-0024) grouped back
+//! into `(start, end, speaker)` spans by `engine.rs`.
 //!
 //! Must run on the *pre-cleanup* word list (before `clean_repetitive_text()` rewrites the
 //! text), so the word<->timestamp alignment used here isn't broken by that later pass --

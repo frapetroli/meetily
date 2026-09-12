@@ -223,11 +223,14 @@ where
 /// duplicated three times.
 ///
 /// Returns `Ok(None)` when the toggle is off (callers should skip diarization entirely,
-/// zero overhead). Returns `Ok(Some((segmentation_model_path, embedding_model_path)))`
-/// when enabled and ready.
+/// zero overhead). Returns
+/// `Ok(Some((segmentation_model_path, embedding_model_path, max_speakers)))` when enabled
+/// and ready -- `max_speakers` is `transcript_settings.diarization_max_speakers` (see
+/// `docs/adr/0024-...md`), read here alongside `diarization_enabled` since the `SqlitePool`
+/// is already in scope, rather than a second pool acquisition in each of the three callers.
 pub async fn resolve_paths_if_enabled<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<(String, String, usize)>, String> {
     use tauri::Manager;
 
     // NOTE: `app_for_state` must be a named binding, not inline `app.clone().state()` --
@@ -244,6 +247,10 @@ pub async fn resolve_paths_if_enabled<R: tauri::Runtime>(
     if !enabled {
         return Ok(None);
     }
+
+    let max_speakers = crate::database::repositories::setting::SettingsRepository::get_diarization_max_speakers(&pool)
+        .await
+        .map_err(|e| format!("Failed to read diarization_max_speakers setting: {}", e))?;
 
     let base = app
         .path()
@@ -263,6 +270,7 @@ pub async fn resolve_paths_if_enabled<R: tauri::Runtime>(
     Ok(Some((
         segmentation_model_path(&base).to_string_lossy().into_owned(),
         embedding_model_path(&base).to_string_lossy().into_owned(),
+        max_speakers,
     )))
 }
 

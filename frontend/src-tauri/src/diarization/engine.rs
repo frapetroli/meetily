@@ -16,12 +16,9 @@
 //!    chunks/the whole call.
 //!
 //! Final speaker identity is resolved once, across every chunk of the call, by
-//! `clustering::cluster_embeddings` (see `finalize()`).
+//! `clustering::cluster_embeddings_spectral_with_p` (see `finalize()`, ADR-0024).
 
-use crate::diarization::clustering::{
-    cluster_embeddings, cluster_embeddings_spectral_with_p, normalize_labels,
-    reattach_small_clusters, DEFAULT_CLUSTERING_THRESHOLD, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD,
-};
+use crate::diarization::clustering::{cluster_embeddings_spectral_with_p, normalize_labels};
 use crate::diarization::merge::SpeakerSegment;
 use sherpa_onnx::{
     OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
@@ -162,71 +159,31 @@ impl DiarizationEngine {
         Ok(())
     }
 
-    /// Same clustering/merge logic as `finalize()`, but takes `&self` (doesn't consume)
-    /// and lets the caller override the three threshold constants instead of always using
-    /// the project's calibrated defaults. Exists so a calibration sweep (see
-    /// `examples/diarization_calibration.rs`) can re-run just the cheap clustering step
-    /// against many threshold combinations without re-running the expensive ONNX
-    /// segmentation/embedding inference in `process_chunk` for every grid point -- that
-    /// inference already happened once, its output is what's sitting in `self.accumulated`.
-    pub fn finalize_with_thresholds(
-        &self,
-        clustering_threshold: f32,
-        min_cluster_size: usize,
-        reattach_threshold: f32,
-    ) -> Vec<SpeakerSegment> {
-        if self.accumulated.is_empty() {
-            return Vec::new();
-        }
-
-        let embeddings: Vec<Vec<f32>> = self.accumulated.iter().map(|(e, _, _)| e.clone()).collect();
-        let labels = cluster_embeddings(&embeddings, clustering_threshold);
-        // Real multi-speaker audio produces many tiny/singleton clusters out of the main
-        // pass (short backchannel interjections, cross-talk) -- see clustering.rs docs on
-        // REATTACH_THRESHOLD and docs/sviluppi/diarization/Architettura pipeline.md,
-        // "Validazione reale...". Fold them into an existing speaker where confident
-        // enough, then compact the resulting label ids back to a contiguous range.
-        let labels = reattach_small_clusters(&embeddings, &labels, min_cluster_size, reattach_threshold);
-        let labels = normalize_labels(&labels);
-
-        let mut segments: Vec<SpeakerSegment> = self
-            .accumulated
-            .iter()
-            .zip(labels)
-            .map(|((_, start, end), label)| SpeakerSegment {
-                start: *start,
-                end: *end,
-                speaker: format!("speaker_{label}"),
-            })
-            .collect();
-        segments.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
-        segments
-    }
-
     /// Cluster everything accumulated across the whole call/import job (one-shot, at
     /// end-of-stream -- ADR-0004/ADR-0009's `diarizing` stage), and return the resulting
     /// speaker-labeled segments sorted by start time. Consumes `self`: a
     /// `DiarizationEngine` is single-use per recording.
     ///
-    /// Thin wrapper over `finalize_with_thresholds` using the project's calibrated
-    /// defaults -- production call sites (session.rs/import.rs/retranscription.rs) are
-    /// unaffected by its existence.
-    pub fn finalize(self) -> Vec<SpeakerSegment> {
-        self.finalize_with_thresholds(DEFAULT_CLUSTERING_THRESHOLD, MIN_CLUSTER_SIZE, REATTACH_THRESHOLD)
+    /// Thin wrapper over `finalize_with_spectral` -- the production entry point called by
+    /// all three call sites (session.rs/import.rs/retranscription.rs), `max_speakers`
+    /// coming from `transcript_settings.diarization_max_speakers`
+    /// (`SettingsRepository::get_diarization_max_speakers`, default
+    /// `clustering::DEFAULT_MAX_SPEAKERS`). See `docs/adr/0024-...md`: this replaced a
+    /// fixed-threshold agglomerative approach (ADR-0017/ADR-0022, removed once this
+    /// superseded it in production) after real-recording calibration showed the
+    /// spectral/NME-SC method dramatically closer to ground truth.
+    pub fn finalize(self, max_speakers: usize) -> Vec<SpeakerSegment> {
+        self.finalize_with_spectral(max_speakers)
     }
 
-    /// Experimental alternative to `finalize`/`finalize_with_thresholds`: clusters the
-    /// same accumulated embeddings with `clustering::cluster_embeddings_spectral`
-    /// (automatic speaker-count estimation via the eigengap heuristic) instead of the
-    /// fixed-threshold agglomerative approach. Not called by any production code path
-    /// (session.rs/import.rs/retranscription.rs) -- exists only for
-    /// `examples/diarization_calibration.rs` to A/B test against `finalize_with_thresholds`
-    /// on real recordings before any decision to use this in production. See
-    /// docs/sviluppi/diarization/Architettura pipeline.md for the rationale.
+    /// Clusters the accumulated embeddings with `clustering::cluster_embeddings_spectral`
+    /// (automatic speaker-count estimation via the NME-SC eigengap heuristic), capped at
+    /// `max_speakers`. Called by `finalize()` (the production entry point, see its doc
+    /// comment and ADR-0024) and by `examples/diarization_calibration.rs` (which calls
+    /// `finalize_with_spectral_and_p` directly to also experiment with a fixed `p`).
     ///
-    /// No `reattach_small_clusters` pass here: the spectral method already bounds the
-    /// cluster count via `max_speakers`, unlike the threshold method's cluster count,
-    /// which the reattach pass exists to rein in.
+    /// No post-hoc cluster-merging pass needed: the eigengap estimate is already bounded
+    /// by `max_speakers`.
     pub fn finalize_with_spectral(&self, max_speakers: usize) -> Vec<SpeakerSegment> {
         self.finalize_with_spectral_and_p(max_speakers, None)
     }
