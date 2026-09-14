@@ -69,12 +69,59 @@ static RECORDING_FLAG: AtomicBool = AtomicBool::new(false);
 static ONNX_RUNTIME_INIT_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 pub(crate) fn ensure_onnx_runtime_available() -> anyhow::Result<()> {
+    #[cfg(all(test, target_os = "windows"))]
+    ensure_test_onnx_runtime_initialized();
+
     #[cfg(target_os = "windows")]
     if let Some(error) = ONNX_RUNTIME_INIT_ERROR.get() {
         anyhow::bail!("{error}");
     }
 
     Ok(())
+}
+
+/// `cargo test` never runs `tauri::Builder::setup()`, so nothing ever calls
+/// `ort::init_from()` with the verified bundled runtime -- `ort` falls back to
+/// its own default DLL search, which on this workspace picks up a stale
+/// `onnxruntime.dll` that a sibling crate's build script (sherpa-onnx-sys, a
+/// real diarization dependency that bundles its own older ONNX Runtime for its
+/// own unrelated use) copies into `target/<profile>/` -- see
+/// docs/sviluppi/diarization/Setup fork.md, "Sync eseguito", for the full
+/// diagnosis. Mirrors the same `ort::init_from()` call `.setup()` makes,
+/// pointed at the same file via `CARGO_MANIFEST_DIR` (there is no `AppHandle`
+/// in a test binary to resolve the Tauri resource path from).
+#[cfg(all(test, target_os = "windows"))]
+fn ensure_test_onnx_runtime_initialized() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let runtime_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries")
+            .join("onnxruntime")
+            .join("onnxruntime.dll");
+
+        if !runtime_path.is_file() {
+            record_onnx_runtime_failure(format!(
+                "Bundled ONNX Runtime not found at {} (run `cargo build` once to stage it)",
+                runtime_path.display()
+            ));
+            return;
+        }
+
+        let result = catch_onnx_runtime_init(|| {
+            ort::init_from(runtime_path.to_string_lossy().into_owned())
+                .with_telemetry(false)
+                .commit()
+                .map(|_| ())
+        });
+
+        if let Err(error) = result {
+            record_onnx_runtime_failure(format!(
+                "Failed to initialize bundled ONNX Runtime from {} for tests: {}",
+                runtime_path.display(),
+                error
+            ));
+        }
+    });
 }
 
 #[cfg(target_os = "windows")]
