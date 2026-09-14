@@ -725,7 +725,7 @@ impl AudioPipeline {
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
         system_device_kind: super::device_detection::InputDeviceKind,
-    ) -> Self {
+    ) -> Result<Self> {
         // Log device characteristics for adaptive buffering
         info!("🎛️ AudioPipeline initializing with device characteristics:");
         info!("   Mic: '{}' ({:?}) - Buffer: {:?}",
@@ -760,19 +760,12 @@ impl AudioPipeline {
         // indefinitely and withheld live transcript emission, so live and batch
         // deliberately diverge. Bounded live segments under continuous speech
         // are tracked in #756.
-        let vad_processor = match ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS) {
-            Ok(processor) => {
-                info!(
-                    "VAD-driven pipeline: segments dispatched per speech burst (redemption_time={}ms)",
-                    VAD_REDEMPTION_TIME_MS
-                );
-                processor
-            }
-            Err(e) => {
-                error!("Failed to create VAD processor: {}", e);
-                panic!("VAD processor creation failed: {}", e);
-            }
-        };
+        let vad_processor =
+            ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
+        info!(
+            "VAD-driven pipeline: segments dispatched per speech burst (redemption_time={}ms)",
+            VAD_REDEMPTION_TIME_MS
+        );
 
         // Initialize professional audio mixing components
         let ring_buffer = AudioMixerRingBuffer::new(sample_rate);
@@ -781,7 +774,7 @@ impl AudioPipeline {
         // Note: target_chunk_duration_ms is ignored - VAD controls segmentation now
         let _ = target_chunk_duration_ms;
 
-        Self {
+        Ok(Self {
             receiver,
             transcription_sender,
             state,
@@ -798,7 +791,7 @@ impl AudioPipeline {
             mixer,
             recording_sender_for_mixed: None,  // Will be set by manager
             diarization_sender_for_mixed: None,  // Will be set by manager, only if diarization is enabled
-        }
+        })
     }
 
     /// Run the VAD-driven audio processing pipeline
@@ -1031,8 +1024,6 @@ impl AudioPipelineManager {
         // Create audio processing channel
         let (audio_sender, audio_receiver) = mpsc::unbounded_channel::<AudioChunk>();
 
-        // Set sender in state for audio captures to use
-        state.set_audio_sender(audio_sender.clone());
 
         // Create and start pipeline with device information for adaptive mixing
         let mut pipeline = AudioPipeline::new(
@@ -1045,7 +1036,8 @@ impl AudioPipelineManager {
             mic_device_kind,
             system_device_name,
             system_device_kind,
-        );
+        )?;
+        state.set_audio_sender(audio_sender.clone());
 
         // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
         // This ensures both mic AND system audio are captured in recordings
