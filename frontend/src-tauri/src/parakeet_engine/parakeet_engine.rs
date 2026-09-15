@@ -1577,7 +1577,11 @@ mod tests {
         ));
 
         hook.continue_load.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), load)
+        // Longer budget than the other waits in this test: this is the one that resumes
+        // native ONNX Runtime loading (`ensure_onnx_runtime_available()`'s process-wide
+        // `Once`-guarded `ort::init_from(...).commit()`, see lib.rs), which does real disk
+        // I/O and can occasionally exceed 1s under `cargo test --lib`'s full parallel run.
+        tokio::time::timeout(Duration::from_secs(10), load)
             .await
             .expect("model load must finish after release")
             .expect("join model load task")

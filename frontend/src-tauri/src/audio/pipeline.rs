@@ -776,8 +776,12 @@ impl AudioPipeline {
         // indefinitely and withheld live transcript emission, so live and batch
         // deliberately diverge. Bounded live segments under continuous speech
         // are tracked in #756.
+        // bound_long_runs=false: leave live's delivery cadence exactly as tuned above.
+        // #756 (linked below) proposes a target/hard-max policy for live specifically,
+        // with its own acceptance criteria and validation this hasn't been through --
+        // the batch path opts into the same underlying mechanism separately (vad.rs).
         let vad_processor =
-            ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
+            ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS, false)?;
         info!(
             "VAD-driven pipeline: segments dispatched per speech burst (redemption_time={}ms)",
             VAD_REDEMPTION_TIME_MS
