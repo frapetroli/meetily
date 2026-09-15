@@ -712,6 +712,22 @@ pub struct AudioPipeline {
     // not the VAD-segmented one, so the diarization segmentation model sees continuous
     // audio instead of speech-only fragments.
     diarization_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    // Denoiser applied to the mixed buffer before it forks to VAD/ASR and diarization
+    // (ADR-0027), active only when denoising_enabled. `recording_sender_for_mixed`
+    // above always gets the raw, non-denoised signal -- this is a transform-and-pass,
+    // not a fourth consumer, so it needs no channel of its own.
+    mixed_audio_denoiser: Option<crate::denoising::StreamingDenoiser>,
+    // Debug copies of the ASR-bound/diarization-bound signal after denoising, written
+    // incrementally to a temp path (never held in memory for the whole recording, same
+    // reasoning as why `IncrementalAudioSaver` checkpoints audio.mp4 instead of
+    // buffering it) and finalized when the pipeline stops. `None` when denoising is
+    // off or the debug files couldn't be created -- best-effort, never fails recording.
+    denoise_debug_asr_writer: Option<crate::denoising::DebugWavWriter>,
+    denoise_debug_diarization_writer: Option<crate::denoising::DebugWavWriter>,
+    // Timestamp of the last chunk processed by the main loop, used to tag the
+    // denoiser's final `flush()` output (which has no timestamp of its own -- it is
+    // produced outside the per-chunk loop, from audio already seen in prior chunks).
+    last_chunk_timestamp: f64,
 }
 
 impl AudioPipeline {
@@ -791,6 +807,10 @@ impl AudioPipeline {
             mixer,
             recording_sender_for_mixed: None,  // Will be set by manager
             diarization_sender_for_mixed: None,  // Will be set by manager, only if diarization is enabled
+            mixed_audio_denoiser: None,  // Will be set by manager, only if denoising is enabled
+            denoise_debug_asr_writer: None,  // Will be set by manager, only if denoising is enabled
+            denoise_debug_diarization_writer: None,
+            last_chunk_timestamp: 0.0,
         })
     }
 
@@ -809,6 +829,8 @@ impl AudioPipeline {
                 self.receiver.recv()
             ).await {
                 Ok(Some(chunk)) => {
+                    self.last_chunk_timestamp = chunk.timestamp;
+
                     // PERFORMANCE: Check for flush signal (special chunk with ID >= u64::MAX - 10)
                     // Multiple flush signals may be sent to ensure processing
                     if chunk.chunk_id >= u64::MAX - 10 {
@@ -862,8 +884,42 @@ impl AudioPipeline {
                             // Previous 2x gain was causing excessive limiting/distortion
                             let mixed_with_gain = mixed_clean;
 
+                            // STEP 2.5: Denoise the mixed buffer, if enabled (ADR-0027).
+                            // One inference pass, then two cheap blends ("Observation
+                            // Adding") -- see denoising::engine for why not two model
+                            // instances. `mixed_with_gain` itself is untouched, so the
+                            // recording fork (STEP 4) always gets the raw signal.
+                            let denoised_signals = self.mixed_audio_denoiser.as_ref().map(|denoiser| {
+                                let denoised = denoiser.process_chunk(&mixed_with_gain, self.sample_rate as i32);
+                                (
+                                    crate::denoising::blend(&mixed_with_gain, &denoised, crate::denoising::ASR_BLEND_WET),
+                                    crate::denoising::blend(&mixed_with_gain, &denoised, crate::denoising::DIARIZATION_BLEND_WET),
+                                )
+                            });
+                            let asr_signal: &[f32] = denoised_signals
+                                .as_ref()
+                                .map(|(asr, _)| asr.as_slice())
+                                .unwrap_or(&mixed_with_gain);
+
+                            // Debug copies: append the exact signals each consumer gets,
+                            // best-effort (a write failure here must never interrupt
+                            // recording -- these are inspection aids, not the canonical
+                            // audio).
+                            if let Some((asr_debug, diar_debug)) = denoised_signals.as_ref() {
+                                if let Some(ref mut writer) = self.denoise_debug_asr_writer {
+                                    if let Err(e) = writer.append(asr_debug) {
+                                        warn!("Failed to append to denoising debug ASR wav: {}", e);
+                                    }
+                                }
+                                if let Some(ref mut writer) = self.denoise_debug_diarization_writer {
+                                    if let Err(e) = writer.append(diar_debug) {
+                                        warn!("Failed to append to denoising debug diarization wav: {}", e);
+                                    }
+                                }
+                            }
+
                             // STEP 3: Send mixed audio for transcription (VAD + Whisper)
-                            match self.vad_processor.process_audio(&mixed_with_gain) {
+                            match self.vad_processor.process_audio(asr_signal) {
                                 Ok(speech_segments) => {
                                     for segment in speech_segments {
                                         let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
@@ -909,10 +965,16 @@ impl AudioPipeline {
                             }
 
                             // STEP 5: Send the same mixed audio to diarization, if enabled
-                            // (ADR-0009: same tap as RecordingSaver, not the VAD-segmented one)
+                            // (ADR-0009: same tap as RecordingSaver, not the VAD-segmented
+                            // one) -- denoised (ADR-0027) when denoising is also enabled,
+                            // otherwise the raw signal exactly as before.
                             if let Some(ref sender) = self.diarization_sender_for_mixed {
+                                let diarization_data = match denoised_signals {
+                                    Some((_, diar)) => diar,
+                                    None => mixed_with_gain,
+                                };
                                 let diarization_chunk = AudioChunk {
-                                    data: mixed_with_gain,
+                                    data: diarization_data,
                                     sample_rate: self.sample_rate,
                                     timestamp: chunk.timestamp,
                                     chunk_id: self.chunk_id_counter,
@@ -937,12 +999,79 @@ impl AudioPipeline {
         // Flush any remaining VAD segments
         self.flush_remaining_audio()?;
 
+        // Finalize the denoising debug WAV files, if any -- patches the RIFF/data
+        // sizes in their headers (see denoising::debug_wav). Must happen after the
+        // last `append` above, and before this task ends, since the caller
+        // (`AudioPipelineManager::wait_for_completion`) treats this task's completion
+        // as the signal that these files are safe to move into the meeting folder.
+        if let Some(writer) = self.denoise_debug_asr_writer.take() {
+            if let Err(e) = writer.finalize() {
+                warn!("Failed to finalize denoising debug ASR wav: {}", e);
+            }
+        }
+        if let Some(writer) = self.denoise_debug_diarization_writer.take() {
+            if let Err(e) = writer.finalize() {
+                warn!("Failed to finalize denoising debug diarization wav: {}", e);
+            }
+        }
+
         info!("VAD-driven audio pipeline ended");
         Ok(())
     }
 
     fn flush_remaining_audio(&mut self) -> Result<()> {
         info!("Flushing remaining audio from pipeline (processed {} chunks)", self.processed_chunks);
+
+        // Flush the denoiser's internal buffer, if enabled (ADR-0027) -- the streaming
+        // DPDFNet denoiser buffers a small amount of audio internally, and `flush()`
+        // returns that trailing tail once, after the last `process_chunk` call. There
+        // is no "original" (pre-denoise) counterpart to blend it against here (it's
+        // already-processed output, not a fresh raw window), so it is forwarded as-is
+        // to VAD/ASR and diarization -- at most a few tens of milliseconds, not worth a
+        // partial-blend heuristic. Never sent to recording: RecordingSaver only ever
+        // sees the raw signal, and that raw audio was already forwarded, chunk by
+        // chunk, in the main loop above.
+        if let Some(ref denoiser) = self.mixed_audio_denoiser {
+            let flushed = denoiser.flush();
+            if !flushed.is_empty() {
+                if let Some(ref mut writer) = self.denoise_debug_asr_writer {
+                    if let Err(e) = writer.append(&flushed) {
+                        warn!("Failed to append flush tail to denoising debug ASR wav: {}", e);
+                    }
+                }
+                if let Some(ref mut writer) = self.denoise_debug_diarization_writer {
+                    if let Err(e) = writer.append(&flushed) {
+                        warn!("Failed to append flush tail to denoising debug diarization wav: {}", e);
+                    }
+                }
+                if let Ok(speech_segments) = self.vad_processor.process_audio(&flushed) {
+                    for segment in speech_segments {
+                        if segment.samples.len() >= 800 {
+                            let transcription_chunk = AudioChunk {
+                                data: segment.samples,
+                                sample_rate: 16000,
+                                timestamp: segment.start_timestamp_ms / 1000.0,
+                                chunk_id: self.chunk_id_counter,
+                                device_type: DeviceType::Microphone,
+                            };
+                            if self.transcription_sender.send(transcription_chunk).is_ok() {
+                                self.chunk_id_counter += 1;
+                            }
+                        }
+                    }
+                }
+                if let Some(ref sender) = self.diarization_sender_for_mixed {
+                    let diarization_chunk = AudioChunk {
+                        data: flushed,
+                        sample_rate: self.sample_rate,
+                        timestamp: self.last_chunk_timestamp,
+                        chunk_id: self.chunk_id_counter,
+                        device_type: DeviceType::Microphone,
+                    };
+                    let _ = sender.send(diarization_chunk);
+                }
+            }
+        }
 
         // Flush any remaining audio from VAD processor and send segments to transcription
         match self.vad_processor.flush() {
@@ -1002,7 +1131,13 @@ impl AudioPipelineManager {
     ///
     /// `diarization_sender` is `Some` only when `transcript_settings.diarization_enabled`
     /// is on (ADR-0010) -- when `None`, no diarization work happens at all, same as
-    /// today (zero overhead when the toggle is off).
+    /// today (zero overhead when the toggle is off). `denoiser` is `Some` only when
+    /// `transcript_settings.denoising_enabled` is on (ADR-0027) -- independent of
+    /// `diarization_sender`, zero overhead when `None`. `denoise_debug_paths`, when
+    /// `Some`, are temp-file destinations (generated by the caller, since the real
+    /// meeting folder doesn't exist yet at this point) for a debug copy of the
+    /// ASR-bound/diarization-bound signal after denoising -- `None` whenever
+    /// `denoiser` is `None` too.
     pub fn start(
         &mut self,
         state: Arc<RecordingState>,
@@ -1011,6 +1146,8 @@ impl AudioPipelineManager {
         sample_rate: u32,
         recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
         diarization_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+        denoiser: Option<crate::denoising::StreamingDenoiser>,
+        denoise_debug_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
         mic_device_name: String,
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
@@ -1044,6 +1181,27 @@ impl AudioPipelineManager {
         pipeline.recording_sender_for_mixed = recording_sender;
         // Same pre-mixed tap for diarization, only wired up if the toggle is on.
         pipeline.diarization_sender_for_mixed = diarization_sender;
+        // Denoises the mixed buffer before it forks to VAD/ASR and diarization
+        // (ADR-0027), only wired up if the denoising toggle is on.
+        pipeline.mixed_audio_denoiser = denoiser;
+
+        // Debug WAV files for the denoised ASR/diarization signal, at temp paths
+        // generated by the caller before the meeting folder exists (it's created
+        // lazily by `RecordingSaver`, later than this point) -- moved into the
+        // meeting folder by `stop_recording` once the pipeline task (and therefore
+        // these writers' `finalize()`) has completed. Best-effort: if creating either
+        // file fails (e.g. temp dir not writable), the corresponding writer stays
+        // `None` and denoising itself is entirely unaffected.
+        if let Some((asr_path, diarization_path)) = denoise_debug_paths {
+            match crate::denoising::DebugWavWriter::create(&asr_path, sample_rate) {
+                Ok(writer) => pipeline.denoise_debug_asr_writer = Some(writer),
+                Err(e) => warn!("Failed to create denoising debug ASR wav at {}: {}", asr_path.display(), e),
+            }
+            match crate::denoising::DebugWavWriter::create(&diarization_path, sample_rate) {
+                Ok(writer) => pipeline.denoise_debug_diarization_writer = Some(writer),
+                Err(e) => warn!("Failed to create denoising debug diarization wav at {}: {}", diarization_path.display(), e),
+            }
+        }
 
         let handle = tokio::spawn(async move {
             pipeline.run().await

@@ -242,6 +242,77 @@ impl SettingsRepository {
         Ok(())
     }
 
+    /// Global opt-in toggle for audio denoising (ADR-0027), default `false`.
+    /// Independent of `diarization_enabled` -- denoising also benefits plain ASR, so it
+    /// is never gated on the diarization toggle. Same dedicated-query pattern as
+    /// `get_diarization_enabled` above (kept out of `TranscriptSetting`/
+    /// `get_transcript_config()`), for the same low-blast-radius reason.
+    pub async fn get_denoising_enabled(pool: &SqlitePool) -> std::result::Result<bool, sqlx::Error> {
+        let enabled: Option<bool> = sqlx::query_scalar(
+            "SELECT denoising_enabled FROM transcript_settings WHERE id = '1' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await?;
+        Ok(enabled.unwrap_or(false))
+    }
+
+    pub async fn save_denoising_enabled(
+        pool: &SqlitePool,
+        enabled: bool,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO transcript_settings (id, provider, model, denoising_enabled)
+            VALUES ('1', 'parakeet', $1, $2)
+            ON CONFLICT(id) DO UPDATE SET
+                denoising_enabled = excluded.denoising_enabled
+            "#,
+        )
+        .bind(crate::config::DEFAULT_PARAKEET_MODEL)
+        .bind(enabled)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Whether to also save, alongside the raw recording, a debug copy of the exact
+    /// signal handed to ASR and to diarization after denoising (`audio_denoised_asr.wav`/
+    /// `audio_denoised_diarization.wav`). Default `false`: these are uncompressed WAV
+    /// files (32-bit float PCM) that add real disk usage -- roughly 1.4GB/hour for a
+    /// live recording (48kHz, two files), ~460MB/hour for batch (16kHz) -- so this is
+    /// opt-in on top of `denoising_enabled`, not automatic. Meaningless when
+    /// `denoising_enabled` is off (there would be nothing to save). Same dedicated-query
+    /// pattern as the settings above.
+    pub async fn get_denoising_save_debug_files(pool: &SqlitePool) -> std::result::Result<bool, sqlx::Error> {
+        let enabled: Option<bool> = sqlx::query_scalar(
+            "SELECT denoising_save_debug_files FROM transcript_settings WHERE id = '1' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await?;
+        Ok(enabled.unwrap_or(false))
+    }
+
+    pub async fn save_denoising_save_debug_files(
+        pool: &SqlitePool,
+        enabled: bool,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO transcript_settings (id, provider, model, denoising_save_debug_files)
+            VALUES ('1', 'parakeet', $1, $2)
+            ON CONFLICT(id) DO UPDATE SET
+                denoising_save_debug_files = excluded.denoising_save_debug_files
+            "#,
+        )
+        .bind(crate::config::DEFAULT_PARAKEET_MODEL)
+        .bind(enabled)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn save_transcript_api_key(
         pool: &SqlitePool,
         provider: &str,

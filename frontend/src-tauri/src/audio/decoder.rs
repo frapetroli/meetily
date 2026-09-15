@@ -51,6 +51,18 @@ impl DecodedAudio {
 
     /// Convert decoded audio to Whisper format with optional progress callback
     pub fn to_whisper_format_with_progress(&self, progress_callback: Option<ProgressCallback>) -> Vec<f32> {
+        let (mono_samples, native_rate) = self.to_mono_normalized();
+        Self::resample_mono_to_16k(&mono_samples, native_rate, progress_callback)
+    }
+
+    /// Step 1 of `to_whisper_format_with_progress`, split out so callers that need the
+    /// audio at its native sample rate (denoising, ADR-0027 -- DPDFNet is trained at
+    /// 48kHz, resampling to 16kHz first then denoising would throw away information
+    /// the model expects) can hook in before the 16kHz resample. Mono conversion +
+    /// normalization only, no resampling. `to_whisper_format_with_progress` above is a
+    /// thin wrapper over this and `resample_mono_to_16k` -- behavior for existing
+    /// callers is unchanged.
+    pub fn to_mono_normalized(&self) -> (Vec<f32>, u32) {
         // Step 1: Convert to mono if needed
         let mono_samples = if self.channels > 1 {
             info!(
@@ -67,9 +79,17 @@ impl DecodedAudio {
         // Some audio files may have samples slightly outside this range
         let mono_samples = normalize_audio_samples(mono_samples);
 
-        // Step 2: Resample to 16kHz if needed
+        (mono_samples, self.sample_rate)
+    }
+
+    /// Step 2 of `to_whisper_format_with_progress`, split out so it can be called on a
+    /// denoised buffer (ADR-0027) instead of only on `to_mono_normalized`'s direct
+    /// output. `native_rate` is the sample rate of `samples` as passed in -- for a
+    /// denoised buffer this is the rate `OfflineDenoiser::process` reports back, which
+    /// is not guaranteed to equal the original decode rate.
+    pub fn resample_mono_to_16k(samples: &[f32], native_rate: u32, progress_callback: Option<ProgressCallback>) -> Vec<f32> {
         const WHISPER_SAMPLE_RATE: u32 = 16000;
-        if self.sample_rate != WHISPER_SAMPLE_RATE {
+        if native_rate != WHISPER_SAMPLE_RATE {
             // Large files are processed in chunks through the sinc resampler
             // to keep memory bounded while preserving audio quality.
             // Linear interpolation (fast_resample) was removed because it lacks
@@ -77,22 +97,22 @@ impl DecodedAudio {
             // miss ~99% of speech in long recordings.
             const LARGE_FILE_THRESHOLD: usize = 14_400_000;
 
-            let mut resampled = if mono_samples.len() > LARGE_FILE_THRESHOLD {
+            let mut resampled = if samples.len() > LARGE_FILE_THRESHOLD {
                 info!(
                     "Chunked sinc resampling {} samples from {}Hz to {}Hz (large file mode)",
-                    mono_samples.len(),
-                    self.sample_rate,
+                    samples.len(),
+                    native_rate,
                     WHISPER_SAMPLE_RATE
                 );
-                chunked_resample_with_progress(&mono_samples, self.sample_rate, WHISPER_SAMPLE_RATE, progress_callback)
+                chunked_resample_with_progress(samples, native_rate, WHISPER_SAMPLE_RATE, progress_callback)
             } else {
                 info!(
                     "Resampling {} samples from {}Hz to {}Hz",
-                    mono_samples.len(),
-                    self.sample_rate,
+                    samples.len(),
+                    native_rate,
                     WHISPER_SAMPLE_RATE
                 );
-                resample_audio(&mono_samples, self.sample_rate, WHISPER_SAMPLE_RATE)
+                resample_audio(samples, native_rate, WHISPER_SAMPLE_RATE)
             };
 
             // Clamp after resampling: the sinc resampler can overshoot
@@ -103,7 +123,7 @@ impl DecodedAudio {
             }
             resampled
         } else {
-            mono_samples
+            samples.to_vec()
         }
     }
 }

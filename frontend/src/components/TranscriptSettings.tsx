@@ -35,6 +35,15 @@ type DiarizationModelStatus =
     | { Corrupted: { file: string } }
     | { Error: string };
 
+// Mirrors Rust's DenoisingModelStatus (denoising/model.rs), same serde convention as
+// DiarizationModelStatus above.
+type DenoisingModelStatus =
+    | 'Available'
+    | 'Missing'
+    | { Downloading: { progress: number } }
+    | { Corrupted: { file: string } }
+    | { Error: string };
+
 export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelConfig, onModelSelect }: TranscriptSettingsProps) {
     const [apiKey, setApiKey] = useState<string | null>(transcriptModelConfig.apiKey || null);
     const [showApiKey, setShowApiKey] = useState<boolean>(false);
@@ -52,6 +61,20 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     // Upper bound passed to the spectral clustering method (NME-SC, ADR-0024), default 20
     // -- see api_get/save_diarization_max_speakers. Saved on blur, not per-keystroke.
     const [maxSpeakers, setMaxSpeakers] = useState<number>(20);
+
+    // Denoising toggle (ADR-0027): global opt-in, default off, independent of the
+    // diarization toggle above -- denoising also benefits plain ASR on its own.
+    const [denoisingEnabled, setDenoisingEnabled] = useState<boolean>(false);
+    const [isDenoisingToggleBusy, setIsDenoisingToggleBusy] = useState<boolean>(false);
+    const [denoisingModelStatus, setDenoisingModelStatus] = useState<DenoisingModelStatus | null>(null);
+    const [denoisingDownloadPercent, setDenoisingDownloadPercent] = useState<number>(0);
+    const [isDenoisingDownloading, setIsDenoisingDownloading] = useState<boolean>(false);
+    const [denoisingDownloadError, setDenoisingDownloadError] = useState<string | null>(null);
+    // Opt-in sub-setting of the toggle above: whether to also save a debug copy of the
+    // denoised ASR/diarization signal. Default off -- uncompressed WAV files, real
+    // disk usage -- see api_get/save_denoising_save_debug_files.
+    const [denoisingSaveDebugFiles, setDenoisingSaveDebugFiles] = useState<boolean>(false);
+    const [isDenoisingSaveDebugFilesBusy, setIsDenoisingSaveDebugFilesBusy] = useState<boolean>(false);
 
     const refreshDiarizationModelStatus = async () => {
         try {
@@ -103,6 +126,54 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         }
     };
 
+    const refreshDenoisingModelStatus = async () => {
+        try {
+            const status = await invoke<DenoisingModelStatus>('denoising_get_status');
+            setDenoisingModelStatus(status);
+        } catch (err) {
+            console.error('Error fetching denoising model status:', err);
+        }
+    };
+
+    // Check model status once denoising is toggled on (no need while it's off)
+    useEffect(() => {
+        if (denoisingEnabled) {
+            refreshDenoisingModelStatus();
+        }
+    }, [denoisingEnabled]);
+
+    useEffect(() => {
+        const unlistenPromises = [
+            listen<{ file: string; percent: number }>('denoising-model-download-progress', (event) => {
+                setDenoisingDownloadPercent(event.payload.percent);
+            }),
+            listen('denoising-model-download-complete', () => {
+                setIsDenoisingDownloading(false);
+                setDenoisingDownloadError(null);
+                refreshDenoisingModelStatus();
+            }),
+            listen<string>('denoising-model-download-error', (event) => {
+                setIsDenoisingDownloading(false);
+                setDenoisingDownloadError(event.payload);
+            }),
+        ];
+        return () => {
+            unlistenPromises.forEach((p) => p.then((unlisten) => unlisten()));
+        };
+    }, []);
+
+    const handleDownloadDenoisingModels = async () => {
+        setIsDenoisingDownloading(true);
+        setDenoisingDownloadPercent(0);
+        setDenoisingDownloadError(null);
+        try {
+            await invoke('denoising_download_models');
+        } catch (err) {
+            setIsDenoisingDownloading(false);
+            setDenoisingDownloadError(String(err));
+        }
+    };
+
     // Sync uiProvider when backend config changes (e.g., after model selection or initial load)
     useEffect(() => {
         setUiProvider(transcriptModelConfig.provider);
@@ -115,6 +186,12 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         invoke<number>('api_get_diarization_max_speakers')
             .then(setMaxSpeakers)
             .catch((err) => console.error('Error fetching diarization_max_speakers:', err));
+        invoke<boolean>('api_get_denoising_enabled')
+            .then(setDenoisingEnabled)
+            .catch((err) => console.error('Error fetching denoising_enabled:', err));
+        invoke<boolean>('api_get_denoising_save_debug_files')
+            .then(setDenoisingSaveDebugFiles)
+            .catch((err) => console.error('Error fetching denoising_save_debug_files:', err));
     }, []);
 
     const handleDiarizationToggle = async (checked: boolean) => {
@@ -138,6 +215,34 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
             await invoke('api_save_diarization_max_speakers', { maxSpeakers: parsed });
         } catch (err) {
             console.error('Error saving diarization_max_speakers:', err);
+        }
+    };
+
+    const handleDenoisingToggle = async (checked: boolean) => {
+        setIsDenoisingToggleBusy(true);
+        const previous = denoisingEnabled;
+        setDenoisingEnabled(checked); // optimistic update
+        try {
+            await invoke('api_save_denoising_enabled', { enabled: checked });
+        } catch (err) {
+            console.error('Error saving denoising_enabled:', err);
+            setDenoisingEnabled(previous); // revert on failure
+        } finally {
+            setIsDenoisingToggleBusy(false);
+        }
+    };
+
+    const handleDenoisingSaveDebugFilesToggle = async (checked: boolean) => {
+        setIsDenoisingSaveDebugFilesBusy(true);
+        const previous = denoisingSaveDebugFiles;
+        setDenoisingSaveDebugFiles(checked); // optimistic update
+        try {
+            await invoke('api_save_denoising_save_debug_files', { enabled: checked });
+        } catch (err) {
+            console.error('Error saving denoising_save_debug_files:', err);
+            setDenoisingSaveDebugFiles(previous); // revert on failure
+        } finally {
+            setIsDenoisingSaveDebugFilesBusy(false);
         }
     };
 
@@ -394,6 +499,77 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                         onChange={(e) => setMaxSpeakers(Number(e.target.value))}
                                         onBlur={(e) => handleMaxSpeakersBlur(e.target.value)}
                                         className="w-20 shrink-0"
+                                    />
+                                </div>
+                            </div>
+                        )}
+                    </div>
+
+                    <div className="pt-2 border-t border-gray-100">
+                        <div className="flex items-center justify-between mt-4">
+                            <div className="pr-4">
+                                <Label className="block text-sm font-medium text-gray-700">
+                                    Audio denoising
+                                </Label>
+                                <p className="text-xs text-gray-500 mt-0.5">
+                                    Reduce background noise before transcription and diarization. Runs
+                                    entirely locally, CPU-only. Requires downloading an additional model
+                                    (~11MB) on first use.
+                                </p>
+                            </div>
+                            <Switch
+                                checked={denoisingEnabled}
+                                disabled={isDenoisingToggleBusy}
+                                onCheckedChange={handleDenoisingToggle}
+                            />
+                        </div>
+
+                        {denoisingEnabled && (
+                            <div className="mt-3 mx-1 p-3 rounded-md border border-gray-200 bg-gray-50">
+                                {isDenoisingDownloading ? (
+                                    <div>
+                                        <p className="text-xs text-gray-600 mb-1">
+                                            Downloading denoising model... {denoisingDownloadPercent}%
+                                        </p>
+                                        <Progress value={denoisingDownloadPercent} />
+                                    </div>
+                                ) : denoisingModelStatus === 'Available' ? (
+                                    <p className="text-xs text-emerald-700">✓ Denoising model ready</p>
+                                ) : (
+                                    <div className="flex items-center justify-between gap-3">
+                                        <p className="text-xs text-gray-600">
+                                            {denoisingDownloadError
+                                                ? `Download failed: ${denoisingDownloadError}`
+                                                : 'Denoising model not downloaded yet. Recording will be blocked while denoising is on until this completes.'}
+                                        </p>
+                                        <Button
+                                            type="button"
+                                            variant="outline"
+                                            size="sm"
+                                            onClick={handleDownloadDenoisingModels}
+                                            className="shrink-0"
+                                        >
+                                            {denoisingDownloadError ? 'Retry' : 'Download'}
+                                        </Button>
+                                    </div>
+                                )}
+
+                                <div className="mt-3 pt-3 border-t border-gray-200 flex items-center justify-between gap-3">
+                                    <div className="pr-4">
+                                        <Label className="block text-xs font-medium text-gray-700">
+                                            Save debug audio files
+                                        </Label>
+                                        <p className="text-xs text-gray-500 mt-0.5">
+                                            Also save the exact denoised signal used by transcription and
+                                            diarization, alongside the recording. Uncompressed WAV files --
+                                            adds real disk usage (roughly 1.4GB/hour for live recordings),
+                                            off by default.
+                                        </p>
+                                    </div>
+                                    <Switch
+                                        checked={denoisingSaveDebugFiles}
+                                        disabled={isDenoisingSaveDebugFilesBusy}
+                                        onCheckedChange={handleDenoisingSaveDebugFilesToggle}
                                     />
                                 </div>
                             </div>

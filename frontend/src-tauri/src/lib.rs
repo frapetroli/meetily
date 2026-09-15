@@ -41,6 +41,7 @@ pub mod audio;
 pub mod config;
 pub mod console_utils;
 pub mod database;
+pub mod denoising;
 pub mod diarization;
 pub mod notifications;
 pub mod ollama;
@@ -778,6 +779,12 @@ pub fn run() {
             api::api_save_diarization_max_speakers,
             diarization::commands::diarization_get_status,
             diarization::commands::diarization_download_models,
+            api::api_get_denoising_enabled,
+            api::api_save_denoising_enabled,
+            api::api_get_denoising_save_debug_files,
+            api::api_save_denoising_save_debug_files,
+            denoising::commands::denoising_get_status,
+            denoising::commands::denoising_download_models,
             api::api_get_transcript_api_key,
             api::api_delete_meeting,
             api::api_get_meeting,

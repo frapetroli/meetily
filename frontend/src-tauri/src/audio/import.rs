@@ -1,9 +1,10 @@
 // Audio file import module - allows importing external audio files as new meetings
 
 use crate::api::TranscriptSegment;
-use crate::audio::decoder::{decode_audio_file, decode_audio_file_with_progress};
+use crate::audio::decoder::{decode_audio_file, decode_audio_file_with_progress, DecodedAudio};
 use crate::audio::vad::get_speech_chunks_with_progress;
 use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
+use crate::denoising::{blend, OfflineDenoiser, ASR_BLEND_WET, DIARIZATION_BLEND_WET};
 use crate::diarization::{assign_word_speakers, clean_speaker_turns, group_into_speaker_turns, DiarizationEngine, SpeakerSegment, WordTiming};
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
@@ -403,7 +404,16 @@ async fn run_import<R: Runtime>(
         return Err(anyhow!("Import cancelled"));
     }
 
-    // Convert to 16kHz mono format with progress updates
+    // Denoising (ADR-0027), if enabled -- gated independently of diarization, checked
+    // before the 16kHz resample because DPDFNet expects the audio at its native rate
+    // (48kHz-hr variant), not downsampled. One inference pass on the native-rate
+    // buffer, then two cheap blends ("Observation Adding") for the ASR-bound and
+    // diarization-bound copies -- see denoising::engine for why two model instances
+    // with different attenuation aren't used instead.
+    let denoising_model_path = crate::denoising::resolve_paths_if_enabled(&app)
+        .await
+        .map_err(|e| anyhow!(e))?;
+
     let app_for_resample = app.clone();
     let resample_progress = Box::new(move |progress: u32, msg: &str| {
         // Map resample progress: 20% + (progress * 0.05) to go from 20% to 25%
@@ -411,11 +421,79 @@ async fn run_import<R: Runtime>(
         emit_progress(&app_for_resample, "resampling", overall_progress, msg);
     });
 
-    let audio_samples = tokio::task::spawn_blocking(move || {
-        decoded.to_whisper_format_with_progress(Some(resample_progress))
-    })
-    .await
-    .map_err(|e| anyhow!("Resample task join error: {}", e))?;
+    let (audio_samples, diarization_samples) = if let Some((model_path, save_debug_files)) = denoising_model_path {
+        let (native_samples, native_rate) =
+            tokio::task::spawn_blocking(move || decoded.to_mono_normalized())
+                .await
+                .map_err(|e| anyhow!("Mono conversion task join error: {}", e))?;
+
+        let native_samples_for_denoise = native_samples.clone();
+        let native_rate_i32 = native_rate as i32;
+        let (denoised, output_rate) = tokio::task::spawn_blocking(move || -> Result<(Vec<f32>, i32)> {
+            // Same lock used around Whisper/Parakeet/diarization engine lifecycle
+            // (audio/common.rs): the denoising model file is written in place (no
+            // temp + rename), so hold it while reading it here to avoid racing a
+            // concurrent re-download.
+            let engine_lifecycle_guard = super::common::acquire_engine_lifecycle_lock_blocking();
+            let denoiser = OfflineDenoiser::new(&model_path, 1)
+                .map_err(|e| anyhow!("Failed to initialize denoising engine: {}", e))?;
+            drop(engine_lifecycle_guard);
+            Ok(denoiser.process(&native_samples_for_denoise, native_rate_i32))
+        })
+        .await
+        .map_err(|e| anyhow!("Denoising task join error: {}", e))??;
+        let output_rate = output_rate as u32;
+
+        let asr_native = blend(&native_samples, &denoised, ASR_BLEND_WET);
+        let diar_native = blend(&native_samples, &denoised, DIARIZATION_BLEND_WET);
+
+        let audio_samples = tokio::task::spawn_blocking(move || {
+            DecodedAudio::resample_mono_to_16k(&asr_native, output_rate, Some(resample_progress))
+        })
+        .await
+        .map_err(|e| anyhow!("Resample task join error: {}", e))?;
+
+        let diarization_samples = tokio::task::spawn_blocking(move || {
+            DecodedAudio::resample_mono_to_16k(&diar_native, output_rate, None)
+        })
+        .await
+        .map_err(|e| anyhow!("Diarization resample task join error: {}", e))?;
+
+        // Debug copies of the exact signal handed to ASR and to diarization, alongside
+        // the raw recording -- opt-in (`denoising_save_debug_files`, default off: these
+        // are uncompressed WAV files, real disk usage), on top of denoising itself
+        // being on. Best-effort: the whole buffer is already in memory here, so
+        // `sherpa_onnx::write()` (one-shot) is enough -- no need for the streaming
+        // writer the live path uses.
+        if save_debug_files {
+            if !sherpa_onnx::write(
+                meeting_folder.join("audio_denoised_asr.wav").to_string_lossy().as_ref(),
+                &audio_samples,
+                16000,
+            ) {
+                warn!("Failed to write audio_denoised_asr.wav debug file");
+            }
+            if !sherpa_onnx::write(
+                meeting_folder.join("audio_denoised_diarization.wav").to_string_lossy().as_ref(),
+                &diarization_samples,
+                16000,
+            ) {
+                warn!("Failed to write audio_denoised_diarization.wav debug file");
+            }
+        }
+
+        (audio_samples, diarization_samples)
+    } else {
+        // Denoising off: identical to the pre-denoising behavior -- one resample, one
+        // clone. No extra allocation or CPU work versus before this feature existed.
+        let audio_samples = tokio::task::spawn_blocking(move || {
+            decoded.to_whisper_format_with_progress(Some(resample_progress))
+        })
+        .await
+        .map_err(|e| anyhow!("Resample task join error: {}", e))?;
+        let diarization_samples = audio_samples.clone();
+        (audio_samples, diarization_samples)
+    };
     info!(
         "Converted to 16kHz mono format: {} samples",
         audio_samples.len()
@@ -430,7 +508,7 @@ async fn run_import<R: Runtime>(
         .map_err(|e| anyhow!(e))?;
     let diarization_enabled = diarization_paths.is_some();
     let diarization_task = diarization_paths.map(|(segmentation_model_path, embedding_model_path, max_speakers)| {
-        let audio_for_diarization = audio_samples.clone();
+        let audio_for_diarization = diarization_samples.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<SpeakerSegment>> {
             // Same lock used around Whisper/Parakeet engine lifecycle (audio/common.rs) and
             // the diarization model download (diarization/commands.rs): model files are

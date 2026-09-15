@@ -107,6 +107,69 @@ static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 // `None` when the toggle is off, same lifecycle scope as RECORDING_MANAGER above.
 static DIARIZATION_SESSION: Mutex<Option<crate::diarization::DiarizationSession>> = Mutex::new(None);
 
+// Temp-file destinations for the denoising debug wav files (ADR-0027), set at
+// recording start (see `denoise_debug_paths` in `AudioPipelineManager::start`) and
+// taken at `stop_recording` once the real meeting folder is known, to move the
+// finalized files into place. `None` when denoising is off or its debug files
+// couldn't be created. Same lifecycle scope as RECORDING_MANAGER above -- the pipeline
+// task (and therefore these files' `finalize()`) is guaranteed complete by the time
+// `stop_recording` reaches the point that reads this static, since
+// `stop_streams_and_force_flush()` (called earlier in the same stop sequence) already
+// awaits the pipeline task to completion.
+static DENOISE_DEBUG_PATHS: Mutex<Option<(std::path::PathBuf, std::path::PathBuf)>> = Mutex::new(None);
+
+/// Generates the two temp-file destinations for the denoising debug wav files
+/// (ASR-bound signal, diarization-bound signal). Used at both recording-start entry
+/// points, only when denoising is enabled -- see `DENOISE_DEBUG_PATHS` above.
+fn generate_denoise_debug_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    let id = uuid::Uuid::new_v4();
+    let dir = std::env::temp_dir();
+    (
+        dir.join(format!("meetily-denoise-debug-asr-{id}.wav")),
+        dir.join(format!("meetily-denoise-debug-diarization-{id}.wav")),
+    )
+}
+
+/// Moves the two finalized denoising debug wav files from their temp location into
+/// the meeting folder, once it's known (`stop_recording`, after cleanup). Safe to call
+/// unconditionally -- a no-op if denoising's debug files were never created (either
+/// path missing, e.g. `DebugWavWriter::create` failed at recording start) or the
+/// pipeline never actually wrote anything to them. Best-effort throughout: a failure
+/// here must never affect the rest of the stop sequence, these are inspection aids,
+/// not the canonical recording.
+///
+/// By the time this runs, the pipeline task that owns these files is guaranteed to
+/// have finished (`AudioPipeline::run()` calls `finalize()` on both writers right
+/// before returning) -- `stop_streams_and_force_flush()`, called earlier in the same
+/// stop sequence, already awaits that same task to completion.
+async fn move_denoise_debug_files(meeting_folder: &std::path::Path) {
+    let Some((asr_temp, diarization_temp)) = DENOISE_DEBUG_PATHS.lock().unwrap().take() else {
+        return;
+    };
+    for (temp_path, final_name) in [
+        (asr_temp, "audio_denoised_asr.wav"),
+        (diarization_temp, "audio_denoised_diarization.wav"),
+    ] {
+        if !temp_path.exists() {
+            continue; // writer was never created, or wrote nothing -- nothing to move
+        }
+        let dest = meeting_folder.join(final_name);
+        if let Err(e) = tokio::fs::rename(&temp_path, &dest).await {
+            // rename fails across filesystems/devices (temp dir vs recordings folder
+            // may not share one) -- fall back to copy + remove.
+            warn!(
+                "Rename failed for denoising debug file ({} -> {}): {} -- falling back to copy",
+                temp_path.display(), dest.display(), e
+            );
+            if let Err(e) = tokio::fs::copy(&temp_path, &dest).await {
+                warn!("Failed to copy denoising debug file to {}: {}", dest.display(), e);
+                continue;
+            }
+            let _ = tokio::fs::remove_file(&temp_path).await;
+        }
+    }
+}
+
 // Per-word timestamps accumulated across the whole call while diarization is active
 // (ADR-0013 point 2d), in recording-relative seconds (chunk-relative timestamps from
 // the ASR engines are offset by each chunk's own start time before being pushed here --
@@ -402,6 +465,23 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     };
     let diarization_sender = diarization_session.as_ref().map(|s| s.sender());
 
+    // Denoising (ADR-0027): opt-in, off by default, independent of the diarization
+    // toggle above. Same "block, don't silently skip" gate as diarization if the
+    // toggle is on but the model isn't downloaded yet.
+    let (denoiser, denoise_save_debug_files) = match crate::denoising::prepare_if_enabled(&app).await {
+        Ok(Some((denoiser, save_debug_files))) => (Some(denoiser), save_debug_files),
+        Ok(None) => (None, false),
+        Err(e) => {
+            error!("Denoising setup failed: {}", e);
+            let _ = app.emit("recording-error", e.clone());
+            return Err(e);
+        }
+    };
+    // Debug wav files are opt-in on top of denoising itself (`denoising_save_debug_files`,
+    // default off -- real disk usage, see SettingsRepository::get_denoising_save_debug_files).
+    let denoise_debug_paths = denoise_save_debug_files.then(generate_denoise_debug_paths);
+    *DENOISE_DEBUG_PATHS.lock().unwrap() = denoise_debug_paths.clone();
+
     // Load recording preferences to get auto_save AND device preferences
     let (auto_save, preferred_mic_name, preferred_system_name) =
         match super::recording_preferences::load_recording_preferences(&app).await {
@@ -452,7 +532,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
 
     // Start recording with resolved devices (replaces start_recording_with_defaults_and_auto_save call)
     let transcription_receiver = manager
-        .start_recording(microphone_device, system_device, auto_save, diarization_sender)
+        .start_recording(microphone_device, system_device, auto_save, diarization_sender, denoiser, denoise_debug_paths)
         .await
         .map_err(|error| map_recording_start_error(&app, error))?;
 
@@ -612,6 +692,23 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     };
     let diarization_sender = diarization_session.as_ref().map(|s| s.sender());
 
+    // Denoising (ADR-0027): opt-in, off by default, independent of the diarization
+    // toggle above. Same "block, don't silently skip" gate as diarization if the
+    // toggle is on but the model isn't downloaded yet.
+    let (denoiser, denoise_save_debug_files) = match crate::denoising::prepare_if_enabled(&app).await {
+        Ok(Some((denoiser, save_debug_files))) => (Some(denoiser), save_debug_files),
+        Ok(None) => (None, false),
+        Err(e) => {
+            error!("Denoising setup failed: {}", e);
+            let _ = app.emit("recording-error", e.clone());
+            return Err(e);
+        }
+    };
+    // Debug wav files are opt-in on top of denoising itself (`denoising_save_debug_files`,
+    // default off -- real disk usage, see SettingsRepository::get_denoising_save_debug_files).
+    let denoise_debug_paths = denoise_save_debug_files.then(generate_denoise_debug_paths);
+    *DENOISE_DEBUG_PATHS.lock().unwrap() = denoise_debug_paths.clone();
+
     #[cfg(not(target_os = "macos"))]
     let mic_device = resolve_mic_or_default(&app, mic_device_name.as_deref());
 
@@ -659,7 +756,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     // Start recording with specified devices and auto_save setting
     let transcription_receiver = manager
-        .start_recording(mic_device, system_device, auto_save, diarization_sender)
+        .start_recording(mic_device, system_device, auto_save, diarization_sender, denoiser, denoise_debug_paths)
         .await
         .map_err(|error| map_recording_start_error(&app, error))?;
 
@@ -1141,6 +1238,13 @@ pub async fn stop_recording<R: Runtime>(
         // Extract meeting info BEFORE async operations
         let meeting_folder = manager.get_meeting_folder();
         let meeting_name = manager.get_meeting_name();
+
+        // Denoising debug wav files (ADR-0027), if any, were written to a temp path
+        // during recording (the meeting folder didn't exist yet at that point) --
+        // move them into place now that it does. See `move_denoise_debug_files`.
+        if let Some(ref folder) = meeting_folder {
+            move_denoise_debug_files(folder).await;
+        }
 
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(300), // 5 minutes max for file I/O

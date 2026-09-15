@@ -742,6 +742,59 @@ pub async fn api_save_diarization_max_speakers<R: Runtime>(
         .map_err(|e| e.to_string())
 }
 
+/// Global opt-in denoising toggle (ADR-0027), default `false`. Independent of the
+/// diarization toggle above -- deliberately separate from
+/// `api_get_transcript_config`/`api_save_transcript_config` for the same reason as
+/// `api_get_diarization_enabled` (see `SettingsRepository::get_denoising_enabled`).
+#[tauri::command]
+pub async fn api_get_denoising_enabled<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let pool = state.db_manager.pool();
+    SettingsRepository::get_denoising_enabled(pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn api_save_denoising_enabled<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    SettingsRepository::save_denoising_enabled(pool, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Opt-in sub-setting of the toggle above: whether to also save a debug copy of the
+/// denoised ASR/diarization signal (see `SettingsRepository::get_denoising_save_debug_files`
+/// for why this defaults to `false` -- extra disk usage, not automatic).
+#[tauri::command]
+pub async fn api_get_denoising_save_debug_files<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let pool = state.db_manager.pool();
+    SettingsRepository::get_denoising_save_debug_files(pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn api_save_denoising_save_debug_files<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    SettingsRepository::save_denoising_save_debug_files(pool, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn api_get_transcript_api_key<R: Runtime>(
     _app: AppHandle<R>,
