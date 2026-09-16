@@ -15,11 +15,11 @@ use tokio::task::JoinHandle;
 /// Chunks are accumulated until they reach this many seconds before being handed to
 /// `DiarizationEngine::process_chunk` -- same ~20-30s cadence already decided in
 /// `docs/sviluppi/diarization/Architettura pipeline.md` (independent of the ASR chunking,
-/// which is VAD-driven, not time-driven). `pub(crate)`: also used by the batch paths
-/// (`audio::import`/`audio::retranscription`), which used to call `process_chunk` once
-/// on the whole decoded file instead of in windows like this live path always has --
+/// which is VAD-driven, not time-driven). The batch paths (`audio::import`/
+/// `audio::retranscription`) deliberately do NOT mirror this chunking -- tried it
+/// (commit 008e42a), measured it 2.3-2.5x *slower* on a real long file, reverted --
 /// see `docs/sviluppi/diarization/Roadmap e todo.md`, voce 9i.
-pub(crate) const WINDOW_SECONDS: f64 = 25.0;
+const WINDOW_SECONDS: f64 = 25.0;
 
 pub struct DiarizationSession {
     /// Clone of this and hand it to `AudioPipelineManager::start()` as the third
