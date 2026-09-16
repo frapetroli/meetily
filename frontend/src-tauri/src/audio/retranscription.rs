@@ -304,12 +304,25 @@ async fn run_retranscription<R: Runtime>(
     info!("Converted to 16kHz mono format: {} samples", audio_samples.len());
 
     // Diarization (ADR-0009/ADR-0013, roadmap 6g): batch path runs on the whole decoded
-    // file in one shot (no incrementality needed, unlike the live path -- the audio is
-    // already fully available), on the same pre-VAD buffer used for transcription, before
-    // it gets moved into the VAD task below. `resolve_paths_if_enabled` reads
+    // file (no incrementality needed, unlike the live path -- the audio is already fully
+    // available), on the same pre-VAD buffer used for transcription, before it gets moved
+    // into the VAD task below. `resolve_paths_if_enabled` reads
     // `transcript_settings.diarization_enabled` and blocks (returns Err) rather than
     // silently skipping if the toggle is on but models aren't downloaded (roadmap 6h,
     // same gate as the live path).
+    //
+    // Fed to `process_chunk` in `diarization::session::WINDOW_SECONDS` windows, same
+    // cadence as the live path (`diarization/session.rs`) -- NOT as one call on the whole
+    // buffer as this used to do. "No incrementality needed" (this buffer is already fully
+    // available, unlike the live path's streaming input) doesn't mean chunking is
+    // pointless here: `process_chunk`'s own doc comment warns that not chunking risks
+    // quadratic cost (ADR-0004), because sherpa-onnx's `OfflineSpeakerDiarization::process()`
+    // does its own internal segmentation + clustering pass over whatever buffer it's
+    // given, once per call -- unrelated to whether the caller *could* have had the whole
+    // file available at once. Under investigation as a lead for the long diarization
+    // times seen on long recordings (docs/sviluppi/diarization/Roadmap e todo.md, voce
+    // 9i) -- this change adds timing logs around both phases to help confirm or rule it
+    // out, not just switch the behavior on faith.
     let diarization_paths = crate::diarization::model::resolve_paths_if_enabled(&app)
         .await
         .map_err(|e| anyhow!(e))?;
@@ -325,10 +338,34 @@ async fn run_retranscription<R: Runtime>(
             let mut engine = DiarizationEngine::new(&segmentation_model_path, &embedding_model_path, 1)
                 .map_err(|e| anyhow!("Failed to initialize diarization engine: {}", e))?;
             drop(engine_lifecycle_guard);
-            engine
-                .process_chunk(&audio_for_diarization, 0.0)
-                .map_err(|e| anyhow!("Diarization processing failed: {}", e))?;
-            Ok(engine.finalize(max_speakers))
+
+            let sample_rate = engine.sample_rate() as usize;
+            let window_samples =
+                (crate::diarization::session::WINDOW_SECONDS * sample_rate as f64) as usize;
+            let process_chunk_started = std::time::Instant::now();
+            let mut window_count = 0usize;
+            for (i, window) in audio_for_diarization.chunks(window_samples.max(1)).enumerate() {
+                let chunk_start_time = (i * window_samples) as f64 / sample_rate as f64;
+                if let Err(e) = engine.process_chunk(window, chunk_start_time) {
+                    warn!("Diarization: process_chunk failed on window {} (start={:.1}s): {}", i, chunk_start_time, e);
+                }
+                window_count += 1;
+            }
+            info!(
+                "Diarization: process_chunk finished, {} windows of {:.0}s in {:?}",
+                window_count,
+                crate::diarization::session::WINDOW_SECONDS,
+                process_chunk_started.elapsed()
+            );
+
+            let finalize_started = std::time::Instant::now();
+            let result = engine.finalize(max_speakers);
+            info!(
+                "Diarization: finalize (clustering) finished in {:?}",
+                finalize_started.elapsed()
+            );
+
+            Ok(result)
         })
     });
 

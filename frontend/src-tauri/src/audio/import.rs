@@ -500,8 +500,11 @@ async fn run_import<R: Runtime>(
     );
 
     // Diarization (ADR-0009/ADR-0013, roadmap 6g) -- same batch treatment as
-    // retranscription.rs: whole decoded file in one shot, on the same pre-VAD buffer,
-    // before it's moved into the VAD task below. See the equivalent block in
+    // retranscription.rs: whole decoded file (no incrementality needed), on the same
+    // pre-VAD buffer, before it's moved into the VAD task below. Fed to `process_chunk`
+    // in `diarization::session::WINDOW_SECONDS` windows -- same cadence as the live path
+    // -- rather than one call on the whole buffer, to respect `process_chunk`'s own
+    // "avoid quadratic cost" contract (ADR-0004). See the equivalent block in
     // retranscription.rs for the full rationale.
     let diarization_paths = crate::diarization::model::resolve_paths_if_enabled(&app)
         .await
@@ -518,10 +521,34 @@ async fn run_import<R: Runtime>(
             let mut engine = DiarizationEngine::new(&segmentation_model_path, &embedding_model_path, 1)
                 .map_err(|e| anyhow!("Failed to initialize diarization engine: {}", e))?;
             drop(engine_lifecycle_guard);
-            engine
-                .process_chunk(&audio_for_diarization, 0.0)
-                .map_err(|e| anyhow!("Diarization processing failed: {}", e))?;
-            Ok(engine.finalize(max_speakers))
+
+            let sample_rate = engine.sample_rate() as usize;
+            let window_samples =
+                (crate::diarization::session::WINDOW_SECONDS * sample_rate as f64) as usize;
+            let process_chunk_started = std::time::Instant::now();
+            let mut window_count = 0usize;
+            for (i, window) in audio_for_diarization.chunks(window_samples.max(1)).enumerate() {
+                let chunk_start_time = (i * window_samples) as f64 / sample_rate as f64;
+                if let Err(e) = engine.process_chunk(window, chunk_start_time) {
+                    warn!("Diarization: process_chunk failed on window {} (start={:.1}s): {}", i, chunk_start_time, e);
+                }
+                window_count += 1;
+            }
+            info!(
+                "Diarization: process_chunk finished, {} windows of {:.0}s in {:?}",
+                window_count,
+                crate::diarization::session::WINDOW_SECONDS,
+                process_chunk_started.elapsed()
+            );
+
+            let finalize_started = std::time::Instant::now();
+            let result = engine.finalize(max_speakers);
+            info!(
+                "Diarization: finalize (clustering) finished in {:?}",
+                finalize_started.elapsed()
+            );
+
+            Ok(result)
         })
     });
 
