@@ -20,6 +20,7 @@
 
 use crate::diarization::clustering::{cluster_embeddings_spectral_with_p, normalize_labels};
 use crate::diarization::merge::SpeakerSegment;
+use log::info;
 use sherpa_onnx::{
     OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
     OfflineSpeakerSegmentationModelConfig, OfflineSpeakerSegmentationPyannoteModelConfig,
@@ -121,12 +122,25 @@ impl DiarizationEngine {
         samples: &[f32],
         chunk_start_time: f64,
     ) -> Result<(), DiarizationEngineError> {
+        // Split timing: the FFI call below is opaque C++/ONNX Runtime (sherpa-onnx's own
+        // segmentation + its internal, otherwise-discarded clustering -- see module docs),
+        // outside our control; the embedding loop after it is ours, so separating the two
+        // says whether a slow process_chunk() (see docs/sviluppi/diarization/Roadmap e
+        // todo.md, voce 9i -- ~36.5s average per 25s window measured, unexplained) is spent
+        // inside sherpa-onnx itself or in our own per-segment re-embedding.
+        let diarizer_started = std::time::Instant::now();
         let result = self
             .diarizer
             .process(samples)
             .ok_or(DiarizationEngineError::ProcessFailed)?;
+        let diarizer_elapsed = diarizer_started.elapsed();
 
-        for seg in result.sort_by_start_time() {
+        let segments = result.sort_by_start_time();
+        let raw_segment_count = segments.len();
+        let mut embedded_count = 0usize;
+
+        let embedding_started = std::time::Instant::now();
+        for seg in segments {
             if seg.end - seg.start < MIN_SEGMENT_DURATION_SECS {
                 continue;
             }
@@ -154,7 +168,19 @@ impl DiarizationEngine {
                 chunk_start_time + seg.start as f64,
                 chunk_start_time + seg.end as f64,
             ));
+            embedded_count += 1;
         }
+        let embedding_elapsed = embedding_started.elapsed();
+
+        info!(
+            "DiarizationEngine::process_chunk(start={:.1}s, {} samples): sherpa-onnx process()={:?} ({} raw segments), embedding loop={:?} ({} embedded)",
+            chunk_start_time,
+            samples.len(),
+            diarizer_elapsed,
+            raw_segment_count,
+            embedding_elapsed,
+            embedded_count
+        );
 
         Ok(())
     }
