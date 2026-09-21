@@ -4,9 +4,11 @@ import { listen } from '@tauri-apps/api/event';
 import { Progress } from './ui/progress';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Input } from './ui/input';
+import { Textarea } from './ui/textarea';
 import { Button } from './ui/button';
 import { Label } from './ui/label';
 import { Switch } from './ui/switch';
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from './ui/dialog';
 import { Eye, EyeOff, Lock, Unlock } from 'lucide-react';
 import { ModelManager } from './WhisperModelManager';
 import { ParakeetModelManager } from './ParakeetModelManager';
@@ -44,6 +46,17 @@ type DenoisingModelStatus =
     | { Corrupted: { file: string } }
     | { Error: string };
 
+// Mirrors Rust's CustomVocabulary (database/models.rs, ADR-0029). Field names are plain
+// snake_case on both sides -- no #[serde(rename)] on the Rust struct, unlike
+// TranscriptSetting's camelCase API-key fields elsewhere in this file.
+interface CustomVocabulary {
+    id: string;
+    name: string;
+    terms: string;
+    created_at: string;
+    updated_at: string;
+}
+
 export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelConfig, onModelSelect }: TranscriptSettingsProps) {
     const [apiKey, setApiKey] = useState<string | null>(transcriptModelConfig.apiKey || null);
     const [showApiKey, setShowApiKey] = useState<boolean>(false);
@@ -75,6 +88,101 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     // disk usage -- see api_get/save_denoising_save_debug_files.
     const [denoisingSaveDebugFiles, setDenoisingSaveDebugFiles] = useState<boolean>(false);
     const [isDenoisingSaveDebugFilesBusy, setIsDenoisingSaveDebugFilesBusy] = useState<boolean>(false);
+
+    // Custom vocabulary (ADR-0029): settings-only Whisper `initial_prompt` bias, managed
+    // here (create/edit/delete + pick the active one), never per-recording. `null` =
+    // "None" (feature off, default) -- see api_get/save_active_vocabulary_id.
+    const [vocabularies, setVocabularies] = useState<CustomVocabulary[]>([]);
+    const [activeVocabularyId, setActiveVocabularyId] = useState<string | null>(null);
+    const [isVocabularyDialogOpen, setIsVocabularyDialogOpen] = useState<boolean>(false);
+    // `null` while the dialog is in "create" mode, the vocabulary being edited otherwise.
+    const [editingVocabulary, setEditingVocabulary] = useState<CustomVocabulary | null>(null);
+    const [vocabularyNameInput, setVocabularyNameInput] = useState<string>('');
+    const [vocabularyTermsInput, setVocabularyTermsInput] = useState<string>('');
+    const [isVocabularySaving, setIsVocabularySaving] = useState<boolean>(false);
+    const [vocabularyError, setVocabularyError] = useState<string | null>(null);
+
+    const refreshVocabularies = async () => {
+        try {
+            const list = await invoke<CustomVocabulary[]>('api_list_vocabularies');
+            setVocabularies(list);
+        } catch (err) {
+            console.error('Error fetching vocabularies:', err);
+        }
+    };
+
+    const handleActiveVocabularyChange = async (value: string) => {
+        const newId = value === 'none' ? null : value;
+        const previous = activeVocabularyId;
+        setActiveVocabularyId(newId); // optimistic update
+        try {
+            await invoke('api_save_active_vocabulary_id', { vocabularyId: newId });
+        } catch (err) {
+            console.error('Error saving active_vocabulary_id:', err);
+            setActiveVocabularyId(previous); // revert on failure
+        }
+    };
+
+    const openCreateVocabularyDialog = () => {
+        setEditingVocabulary(null);
+        setVocabularyNameInput('');
+        setVocabularyTermsInput('');
+        setVocabularyError(null);
+        setIsVocabularyDialogOpen(true);
+    };
+
+    const openEditVocabularyDialog = (vocabulary: CustomVocabulary) => {
+        setEditingVocabulary(vocabulary);
+        setVocabularyNameInput(vocabulary.name);
+        setVocabularyTermsInput(vocabulary.terms);
+        setVocabularyError(null);
+        setIsVocabularyDialogOpen(true);
+    };
+
+    const handleSaveVocabulary = async () => {
+        const name = vocabularyNameInput.trim();
+        const terms = vocabularyTermsInput.trim();
+        if (!name) {
+            setVocabularyError('Name is required');
+            return;
+        }
+        setIsVocabularySaving(true);
+        setVocabularyError(null);
+        try {
+            if (editingVocabulary) {
+                await invoke('api_update_vocabulary', { id: editingVocabulary.id, name, terms });
+            } else {
+                await invoke('api_create_vocabulary', { name, terms });
+            }
+            await refreshVocabularies();
+            setIsVocabularyDialogOpen(false);
+        } catch (err) {
+            setVocabularyError(String(err));
+        } finally {
+            setIsVocabularySaving(false);
+        }
+    };
+
+    const handleDeleteVocabulary = async (vocabulary: CustomVocabulary) => {
+        if (!window.confirm(`Delete vocabulary "${vocabulary.name}"?`)) {
+            return;
+        }
+        try {
+            await invoke('api_delete_vocabulary', { id: vocabulary.id });
+            setVocabularies((prev) => prev.filter((v) => v.id !== vocabulary.id));
+            // Backend already falls back defensively at read time if the deleted vocabulary
+            // was active (VocabularyRepository::resolve_active_terms), but the stored
+            // active_vocabulary_id setting itself would otherwise be left pointing at a
+            // vocabulary that no longer exists -- clear it explicitly so a later reload
+            // doesn't show the Select with a value matching no option.
+            if (activeVocabularyId === vocabulary.id) {
+                setActiveVocabularyId(null);
+                await invoke('api_save_active_vocabulary_id', { vocabularyId: null });
+            }
+        } catch (err) {
+            console.error('Error deleting vocabulary:', err);
+        }
+    };
 
     const refreshDiarizationModelStatus = async () => {
         try {
@@ -192,6 +300,10 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         invoke<boolean>('api_get_denoising_save_debug_files')
             .then(setDenoisingSaveDebugFiles)
             .catch((err) => console.error('Error fetching denoising_save_debug_files:', err));
+        refreshVocabularies();
+        invoke<string | null>('api_get_active_vocabulary_id')
+            .then(setActiveVocabularyId)
+            .catch((err) => console.error('Error fetching active_vocabulary_id:', err));
     }, []);
 
     const handleDiarizationToggle = async (checked: boolean) => {
@@ -575,8 +687,128 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                             </div>
                         )}
                     </div>
+
+                    <div className="pt-2 border-t border-gray-100">
+                        <div className="mt-4">
+                            <Label className="block text-sm font-medium text-gray-700">
+                                Custom vocabulary
+                            </Label>
+                            <p className="text-xs text-gray-500 mt-0.5">
+                                Bias transcription toward expected names, acronyms, and technical
+                                jargon. Whisper only -- Parakeet has no vocabulary-bias support.
+                                Managed here, not per-recording.
+                            </p>
+                        </div>
+
+                        <div className="mt-3 mx-1">
+                            <Label className="block text-xs font-medium text-gray-700 mb-1">
+                                Active vocabulary
+                            </Label>
+                            <Select
+                                value={activeVocabularyId ?? 'none'}
+                                onValueChange={handleActiveVocabularyChange}
+                            >
+                                <SelectTrigger className="focus:ring-1 focus:ring-blue-500 focus:border-blue-500">
+                                    <SelectValue placeholder="None" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                    <SelectItem value="none">None</SelectItem>
+                                    {vocabularies.map((vocabulary) => (
+                                        <SelectItem key={vocabulary.id} value={vocabulary.id}>
+                                            {vocabulary.name}
+                                        </SelectItem>
+                                    ))}
+                                </SelectContent>
+                            </Select>
+                        </div>
+
+                        <div className="mt-3 mx-1 p-3 rounded-md border border-gray-200 bg-gray-50">
+                            <div className="flex items-center justify-between mb-2">
+                                <Label className="block text-xs font-medium text-gray-700">
+                                    Saved vocabularies
+                                </Label>
+                                <Button type="button" variant="outline" size="sm" onClick={openCreateVocabularyDialog}>
+                                    + New vocabulary
+                                </Button>
+                            </div>
+                            {vocabularies.length === 0 ? (
+                                <p className="text-xs text-gray-500">No vocabularies yet.</p>
+                            ) : (
+                                <ul className="space-y-1">
+                                    {vocabularies.map((vocabulary) => (
+                                        <li key={vocabulary.id} className="flex items-center justify-between gap-2 text-xs">
+                                            <span className="truncate">{vocabulary.name}</span>
+                                            <div className="flex items-center gap-1 shrink-0">
+                                                <Button
+                                                    type="button"
+                                                    variant="ghost"
+                                                    size="sm"
+                                                    onClick={() => openEditVocabularyDialog(vocabulary)}
+                                                >
+                                                    Edit
+                                                </Button>
+                                                <Button
+                                                    type="button"
+                                                    variant="ghost"
+                                                    size="sm"
+                                                    onClick={() => handleDeleteVocabulary(vocabulary)}
+                                                >
+                                                    Delete
+                                                </Button>
+                                            </div>
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+                        </div>
+                    </div>
                 </div>
             </div>
+
+            <Dialog open={isVocabularyDialogOpen} onOpenChange={setIsVocabularyDialogOpen}>
+                <DialogContent>
+                    <DialogHeader>
+                        <DialogTitle>{editingVocabulary ? 'Edit vocabulary' : 'New vocabulary'}</DialogTitle>
+                    </DialogHeader>
+                    <div className="space-y-3">
+                        <div>
+                            <Label className="block text-sm font-medium text-gray-700 mb-1">
+                                Name
+                            </Label>
+                            <Input
+                                value={vocabularyNameInput}
+                                onChange={(e) => setVocabularyNameInput(e.target.value)}
+                                placeholder="e.g. Project Atlas"
+                            />
+                        </div>
+                        <div>
+                            <Label className="block text-sm font-medium text-gray-700 mb-1">
+                                Terms
+                            </Label>
+                            <Textarea
+                                value={vocabularyTermsInput}
+                                onChange={(e) => setVocabularyTermsInput(e.target.value)}
+                                placeholder="Keycloak, ForgeRock, SSO, ..."
+                                rows={4}
+                            />
+                            <p className="text-xs text-gray-500 mt-1">
+                                Names, acronyms, or jargon expected in this vocabulary's recordings.
+                            </p>
+                        </div>
+                        {vocabularyError && (
+                            <p className="text-xs text-red-600">{vocabularyError}</p>
+                        )}
+                    </div>
+                    <DialogFooter>
+                        <Button type="button" variant="outline" onClick={() => setIsVocabularyDialogOpen(false)}>
+                            Cancel
+                        </Button>
+                        <Button type="button" onClick={handleSaveVocabulary} disabled={isVocabularySaving}>
+                            {isVocabularySaving ? 'Saving...' : 'Save'}
+                        </Button>
+                    </DialogFooter>
+                </DialogContent>
+            </Dialog>
         </div >
     )
 }

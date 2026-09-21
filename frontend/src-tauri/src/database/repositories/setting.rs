@@ -313,6 +313,42 @@ impl SettingsRepository {
         Ok(())
     }
 
+    /// Id of the `custom_vocabularies` row currently active for Whisper's `initial_prompt`
+    /// vocabulary bias (ADR-0029), or `None` ("Nessuno", default -- feature off). Same
+    /// dedicated-query pattern as `get_diarization_enabled` above, for the same reason.
+    /// Double `Option` because the column itself is nullable (unlike the other settings
+    /// here): the outer `Option` is "row exists at all", the inner is "column is NULL".
+    pub async fn get_active_vocabulary_id(
+        pool: &SqlitePool,
+    ) -> std::result::Result<Option<String>, sqlx::Error> {
+        let id: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT active_vocabulary_id FROM transcript_settings WHERE id = '1' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await?;
+        Ok(id.flatten())
+    }
+
+    pub async fn save_active_vocabulary_id(
+        pool: &SqlitePool,
+        vocabulary_id: Option<&str>,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO transcript_settings (id, provider, model, active_vocabulary_id)
+            VALUES ('1', 'parakeet', $1, $2)
+            ON CONFLICT(id) DO UPDATE SET
+                active_vocabulary_id = excluded.active_vocabulary_id
+            "#,
+        )
+        .bind(crate::config::DEFAULT_PARAKEET_MODEL)
+        .bind(vocabulary_id)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn save_transcript_api_key(
         pool: &SqlitePool,
         provider: &str,

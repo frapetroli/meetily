@@ -6,10 +6,10 @@ use tauri_plugin_store::StoreExt;
 
 use crate::{
     database::{
-        models::MeetingModel,
+        models::{CustomVocabulary, MeetingModel},
         repositories::{
             meeting::MeetingsRepository, setting::SettingsRepository,
-            transcript::TranscriptsRepository,
+            transcript::TranscriptsRepository, vocabulary::VocabularyRepository,
         },
     },
     state::AppState,
@@ -791,6 +791,91 @@ pub async fn api_save_denoising_save_debug_files<R: Runtime>(
 ) -> Result<(), String> {
     let pool = state.db_manager.pool();
     SettingsRepository::save_denoising_save_debug_files(pool, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Custom vocabularies for Whisper's `initial_prompt` bias (ADR-0029), settings-only:
+/// created/edited/selected in Settings, not per-recording. CRUD lives entirely on the
+/// `custom_vocabularies` table; `active_vocabulary_id` (below) is the one currently
+/// selected, `None` = "Nessuno" (feature off, default).
+#[tauri::command]
+pub async fn api_list_vocabularies<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<CustomVocabulary>, String> {
+    let pool = state.db_manager.pool();
+    VocabularyRepository::list(pool).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn api_create_vocabulary<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    name: String,
+    terms: String,
+) -> Result<CustomVocabulary, String> {
+    let pool = state.db_manager.pool();
+    VocabularyRepository::create(pool, &name, &terms)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Returns an error if `id` doesn't exist (e.g. deleted concurrently in another window) --
+/// unlike the toggle-style settings above, a CRUD update on a missing row is a real error
+/// the frontend should surface, not a silent no-op.
+#[tauri::command]
+pub async fn api_update_vocabulary<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    id: String,
+    name: String,
+    terms: String,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    match VocabularyRepository::update(pool, &id, &name, &terms).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("Vocabulary '{}' not found", id)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Deleting the currently-active vocabulary is allowed -- `VocabularyRepository::resolve_active_terms`
+/// falls back to no vocabulary bias defensively, the frontend doesn't need to clear
+/// `active_vocabulary_id` first.
+#[tauri::command]
+pub async fn api_delete_vocabulary<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    match VocabularyRepository::delete(pool, &id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("Vocabulary '{}' not found", id)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn api_get_active_vocabulary_id<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let pool = state.db_manager.pool();
+    SettingsRepository::get_active_vocabulary_id(pool)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn api_save_active_vocabulary_id<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    vocabulary_id: Option<String>,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    SettingsRepository::save_active_vocabulary_id(pool, vocabulary_id.as_deref())
         .await
         .map_err(|e| e.to_string())
 }

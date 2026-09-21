@@ -111,6 +111,19 @@ impl Setting {
     }
 }
 
+/// A named list of expected terms (names, acronyms, technical jargon) the user can create
+/// and select to bias Whisper's decoding via `initial_prompt` (see docs/adr/0029). `terms`
+/// is free text, stored/passed as-is (no structured parsing) -- `WhisperEngine::build_initial_prompt`
+/// truncates it if needed, nothing else interprets its internal format.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct CustomVocabulary {
+    pub id: String,
+    pub name: String,
+    pub terms: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct TranscriptSetting {
     pub id: String,

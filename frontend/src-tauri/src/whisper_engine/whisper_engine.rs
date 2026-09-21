@@ -626,13 +626,100 @@ impl WhisperEngine {
         repeated_words as f32 / total_words
     }
     
+    /// Chars of the previous chunk's transcript carried forward as `initial_prompt` context
+    /// (see `build_prompt_context`). ~200 chars is roughly the trailing sentence or two --
+    /// enough to disambiguate a name/term repeated across a VAD chunk boundary without
+    /// dragging forward stale context from many chunks ago.
+    pub const PROMPT_CONTEXT_MAX_CHARS: usize = 200;
+
+    /// Builds the whisper.cpp `initial_prompt` carried from one VAD chunk's transcription to
+    /// the next, so each chunk gets short-range continuity (recurring proper nouns/jargon)
+    /// instead of being decoded in total isolation -- each chunk otherwise starts from a
+    /// fresh `WhisperState` (`ctx.create_state()`) with no memory of prior chunks.
+    ///
+    /// Takes the trailing `max_chars` characters of `previous_text`, then advances to the
+    /// next word boundary so the prompt never starts mid-word. Pure/testable without a
+    /// loaded model -- callers are expected to pass the already-cleaned transcript (post
+    /// `clean_repetitive_text`), never raw/hallucinated text.
+    pub fn build_prompt_context(previous_text: &str, max_chars: usize) -> String {
+        let trimmed = previous_text.trim();
+        let char_count = trimmed.chars().count();
+        if char_count <= max_chars {
+            return trimmed.to_string();
+        }
+        let skip = char_count - max_chars;
+        let tail: String = trimmed.chars().skip(skip).collect();
+        match tail.find(char::is_whitespace) {
+            Some(pos) => tail[pos..].trim_start().to_string(),
+            None => tail, // No whitespace in the tail (one very long token) -- keep as-is.
+        }
+    }
+
+    /// Chars of the active custom vocabulary (ADR-0029) reserved in the combined prompt
+    /// (see `build_initial_prompt`), leaving the rest of the budget to `PROMPT_CONTEXT_MAX_CHARS`
+    /// worth of cross-chunk continuity (ADR-0028).
+    pub const VOCABULARY_CONTEXT_MAX_CHARS: usize = 150;
+
+    /// Truncates `text` to at most `max_chars`, keeping the **head** and cutting at the
+    /// last word boundary before the limit (never mid-word). Used for the vocabulary piece
+    /// of `build_initial_prompt` -- unlike `build_prompt_context` (which keeps the tail,
+    /// because recent transcript text matters most for continuity), a vocabulary list reads
+    /// naturally from the start, so the first terms are what should survive truncation.
+    pub fn truncate_vocabulary(text: &str, max_chars: usize) -> String {
+        let trimmed = text.trim();
+        if trimmed.chars().count() <= max_chars {
+            return trimmed.to_string();
+        }
+        let head: String = trimmed.chars().take(max_chars).collect();
+        match head.rfind(char::is_whitespace) {
+            Some(pos) => head[..pos].trim_end().to_string(),
+            None => head, // No whitespace before the limit (one very long token) -- keep as-is.
+        }
+    }
+
+    /// Combines the active custom vocabulary (ADR-0029) with the cross-chunk continuity
+    /// text (ADR-0028) into the single `initial_prompt` whisper.cpp accepts per call.
+    ///
+    /// The vocabulary is included on **every** chunk/segment (not just the first) so the
+    /// bias doesn't fade out once `previous_text` starts carrying real transcript content
+    /// instead of being empty. `previous_text` is expected to already be sized by the
+    /// caller (e.g. via `build_prompt_context`) -- this function does not re-truncate it,
+    /// only the vocabulary piece (which comes straight from user-entered/DB-stored text of
+    /// unknown length).
+    ///
+    /// Returns `None` when both inputs are `None`/empty -- identical behavior to passing
+    /// `None` as `previous_text` to `transcribe_audio_with_confidence`/`transcribe_audio`
+    /// today (no `initial_prompt` set, zero behavior change for callers with neither).
+    pub fn build_initial_prompt(vocabulary_terms: Option<&str>, previous_text: Option<&str>) -> Option<String> {
+        let vocabulary = vocabulary_terms
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| Self::truncate_vocabulary(v, Self::VOCABULARY_CONTEXT_MAX_CHARS));
+        let context = previous_text
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string);
+
+        match (vocabulary, context) {
+            (Some(v), Some(c)) => Some(format!("{} {}", v, c)),
+            (Some(v), None) => Some(v),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        }
+    }
+
     /// Transcribe audio with streaming support for partial results and adaptive quality.
     ///
     /// `include_word_timestamps` gates the diarization word-timestamp extraction
     /// (ADR-0013): when `false` (the default, diarization toggle off), behavior and cost
     /// are identical to before this parameter existed. When `true`, the returned
     /// `Option<Vec<WordTiming>>` is populated.
-    pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>, include_word_timestamps: bool) -> Result<(String, f32, bool, Option<Vec<WordTiming>>)> {
+    ///
+    /// `previous_text`, when `Some` and non-empty, is set as whisper.cpp's `initial_prompt`
+    /// for cross-chunk continuity -- see `build_prompt_context`. Callers own the truncation
+    /// (this function does not call `build_prompt_context` itself), so pass the string
+    /// already sized for the prompt.
+    pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>, include_word_timestamps: bool, previous_text: Option<&str>) -> Result<(String, f32, bool, Option<Vec<WordTiming>>)> {
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
@@ -658,6 +745,16 @@ impl WhisperEngine {
         };
         params.set_language(language_code);
         params.set_translate(should_translate);
+
+        // Cross-chunk continuity (see `build_prompt_context`): each chunk starts from a
+        // fresh `WhisperState` below, so without this the model has no memory of what was
+        // just said. Ignored entirely when `previous_text` is `None`/empty -- zero behavior
+        // change for callers that don't pass one.
+        if let Some(prompt) = previous_text {
+            if !prompt.is_empty() {
+                params.set_initial_prompt(prompt);
+            }
+        }
 
         // CRITICAL: Disable timestamp tokens to prevent whisper.cpp chunking heuristics
         // The "single timestamp ending - skip entire chunk" optimization incorrectly discards
@@ -764,7 +861,11 @@ impl WhisperEngine {
     /// `include_word_timestamps` gates the diarization word-timestamp extraction
     /// (ADR-0013), same contract as `transcribe_audio_with_confidence`. Used by the
     /// batch paths (`import.rs`/`retranscription.rs`).
-    pub async fn transcribe_audio(&self, audio_data: Vec<f32>, language: Option<String>, include_word_timestamps: bool) -> Result<(String, Option<Vec<WordTiming>>)> {
+    ///
+    /// `previous_text`, when `Some` and non-empty, is set as whisper.cpp's `initial_prompt`
+    /// for cross-chunk continuity -- see `build_prompt_context`. Same contract as
+    /// `transcribe_audio_with_confidence`.
+    pub async fn transcribe_audio(&self, audio_data: Vec<f32>, language: Option<String>, include_word_timestamps: bool, previous_text: Option<&str>) -> Result<(String, Option<Vec<WordTiming>>)> {
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
@@ -790,6 +891,14 @@ impl WhisperEngine {
         };
         params.set_language(language_code);
         params.set_translate(should_translate);
+
+        // Cross-chunk continuity (see `build_prompt_context`) -- same rationale as in
+        // `transcribe_audio_with_confidence`.
+        if let Some(prompt) = previous_text {
+            if !prompt.is_empty() {
+                params.set_initial_prompt(prompt);
+            }
+        }
 
         // CRITICAL: Disable timestamp tokens to prevent whisper.cpp chunking heuristics
         // The "single timestamp ending - skip entire chunk" optimization incorrectly discards
@@ -1982,5 +2091,126 @@ mod tests {
     #[test]
     fn merge_tokens_into_words_returns_empty_for_no_tokens() {
         assert!(merge_tokens_into_words(&[]).is_empty());
+    }
+
+    // -- build_prompt_context (cross-chunk continuity) -------------------------------------
+
+    #[test]
+    fn build_prompt_context_returns_short_text_unchanged() {
+        assert_eq!(
+            WhisperEngine::build_prompt_context("hello world", 200),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn build_prompt_context_trims_surrounding_whitespace() {
+        assert_eq!(
+            WhisperEngine::build_prompt_context("  hello world  ", 200),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn build_prompt_context_truncates_to_tail_and_advances_past_partial_word() {
+        // Keeping the last 9 chars of "one two three four" (18 chars) lands mid-word:
+        // the raw tail is "hree four" (a truncated "three"). The partial leading word must
+        // be dropped entirely, not kept truncated.
+        let result = WhisperEngine::build_prompt_context("one two three four", 9);
+        assert_eq!(result, "four");
+        assert!(!result.starts_with("hree"));
+    }
+
+    #[test]
+    fn build_prompt_context_keeps_whole_words_when_boundary_lands_exactly_on_a_space() {
+        let result = WhisperEngine::build_prompt_context("one two three four", 11); // " three four"
+        assert_eq!(result, "three four");
+    }
+
+    #[test]
+    fn build_prompt_context_returns_raw_tail_when_no_whitespace_found() {
+        let long_token = "a".repeat(20);
+        let result = WhisperEngine::build_prompt_context(&long_token, 5);
+        assert_eq!(result, "aaaaa");
+    }
+
+    #[test]
+    fn build_prompt_context_returns_empty_for_empty_or_whitespace_only_input() {
+        assert_eq!(WhisperEngine::build_prompt_context("", 200), "");
+        assert_eq!(WhisperEngine::build_prompt_context("   ", 200), "");
+    }
+
+    // -- truncate_vocabulary (domain vocabulary bias, ADR-0029) ----------------------------
+
+    #[test]
+    fn truncate_vocabulary_returns_short_text_unchanged() {
+        assert_eq!(
+            WhisperEngine::truncate_vocabulary("Keycloak, ForgeRock", 150),
+            "Keycloak, ForgeRock"
+        );
+    }
+
+    #[test]
+    fn truncate_vocabulary_keeps_the_head_and_advances_before_partial_word() {
+        // "one two three four" (18 chars): keeping the first 12 chars lands mid-word
+        // ("one two thr"). The partial trailing word must be dropped, not kept truncated.
+        let result = WhisperEngine::truncate_vocabulary("one two three four", 12);
+        assert_eq!(result, "one two");
+        assert!(!result.ends_with("thr"));
+    }
+
+    #[test]
+    fn truncate_vocabulary_returns_raw_head_when_no_whitespace_found() {
+        let long_token = "a".repeat(20);
+        let result = WhisperEngine::truncate_vocabulary(&long_token, 5);
+        assert_eq!(result, "aaaaa");
+    }
+
+    #[test]
+    fn truncate_vocabulary_returns_empty_for_empty_or_whitespace_only_input() {
+        assert_eq!(WhisperEngine::truncate_vocabulary("", 150), "");
+        assert_eq!(WhisperEngine::truncate_vocabulary("   ", 150), "");
+    }
+
+    // -- build_initial_prompt (combines vocabulary + cross-chunk continuity) --------------
+
+    #[test]
+    fn build_initial_prompt_returns_none_when_both_inputs_absent() {
+        assert_eq!(WhisperEngine::build_initial_prompt(None, None), None);
+        assert_eq!(WhisperEngine::build_initial_prompt(Some(""), Some("  ")), None);
+    }
+
+    #[test]
+    fn build_initial_prompt_returns_vocabulary_only_when_no_previous_text() {
+        assert_eq!(
+            WhisperEngine::build_initial_prompt(Some("Keycloak, ForgeRock"), None),
+            Some("Keycloak, ForgeRock".to_string())
+        );
+    }
+
+    #[test]
+    fn build_initial_prompt_returns_previous_text_only_when_no_vocabulary() {
+        assert_eq!(
+            WhisperEngine::build_initial_prompt(None, Some("hello world")),
+            Some("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn build_initial_prompt_combines_both_with_vocabulary_first() {
+        assert_eq!(
+            WhisperEngine::build_initial_prompt(Some("Keycloak, ForgeRock"), Some("hello world")),
+            Some("Keycloak, ForgeRock hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn build_initial_prompt_does_not_retruncate_previous_text() {
+        // previous_text longer than PROMPT_CONTEXT_MAX_CHARS is passed through as-is --
+        // callers (worker.rs/import.rs/retranscription.rs) are responsible for sizing it
+        // via `build_prompt_context` before calling this function.
+        let long_context = "x".repeat(500);
+        let result = WhisperEngine::build_initial_prompt(None, Some(&long_context));
+        assert_eq!(result, Some(long_context));
     }
 }

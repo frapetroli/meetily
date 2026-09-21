@@ -25,9 +25,12 @@ impl TranscriptionProvider for WhisperProvider {
         language: Option<String>,
         include_word_timestamps: bool,
     ) -> std::result::Result<TranscriptResult, TranscriptionError> {
+        // `previous_text: None` -- this trait-based path has no live caller yet (see
+        // `TranscriptionEngine::Provider`, never constructed today), so there's no cross-chunk
+        // state to thread through here. Same status as `include_word_timestamps` below.
         match self
             .engine
-            .transcribe_audio_with_confidence(audio, language, include_word_timestamps)
+            .transcribe_audio_with_confidence(audio, language, include_word_timestamps, None)
             .await
         {
             Ok((text, confidence, is_partial, word_timestamps)) => Ok(TranscriptResult {

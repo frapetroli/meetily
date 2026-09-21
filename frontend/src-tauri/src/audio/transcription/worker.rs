@@ -55,6 +55,11 @@ pub fn start_transcription_task<R: Runtime>(
     tokio::spawn(async move {
         info!("🚀 Starting optimized parallel transcription task - guaranteeing zero chunk loss");
 
+        // Active custom vocabulary (ADR-0029), resolved once for the whole session -- not
+        // re-queried per chunk. `None` when no vocabulary is selected (default) or if
+        // resolution fails for any reason (soft-fail, see `resolve_active_terms`).
+        let vocabulary_terms = crate::database::repositories::vocabulary::VocabularyRepository::resolve_active_terms(&app).await;
+
         // Initialize transcription engine (Whisper or Parakeet based on config)
         let transcription_engine = match super::engine::get_or_init_transcription_engine(&app).await {
             Ok(engine) => engine,
@@ -91,6 +96,7 @@ pub fn start_transcription_task<R: Runtime>(
                 TranscriptionEngine::Provider(p) => TranscriptionEngine::Provider(p.clone()),
             };
             let app_clone = app.clone();
+            let vocabulary_terms_clone = vocabulary_terms.clone();
             let work_receiver_clone = work_receiver.clone();
             let chunks_completed_clone = chunks_completed.clone();
             let input_finished_clone = input_finished.clone();
@@ -116,6 +122,13 @@ pub fn start_transcription_task<R: Runtime>(
                 } else {
                     warn!("⚠️ Worker {} pre-validation: {} model not loaded - chunks may be skipped", worker_id, engine_name);
                 }
+
+                // Cross-chunk continuity for Whisper (see `WhisperEngine::build_prompt_context`):
+                // the cleaned text of the last non-empty chunk, carried forward as the next
+                // chunk's decode prompt. Local to this worker's loop -- fresh per recording
+                // session (NUM_WORKERS is always 1, so there's exactly one of these per session),
+                // and simply unread by Parakeet (no prompt-conditioning API).
+                let mut previous_text: Option<String> = None;
 
                 loop {
                     // Try to get a chunk to process
@@ -154,15 +167,29 @@ pub fn start_transcription_task<R: Runtime>(
                             // reflects whether a diarization session is active for this recording
                             // (ADR-0013) -- `false` (the default) costs nothing extra in the engines.
                             let include_word_timestamps = crate::audio::recording_commands::is_diarization_active();
+                            // Combines the active vocabulary (ADR-0029, resolved once above)
+                            // with this session's cross-chunk continuity (ADR-0028) into the
+                            // single `initial_prompt` whisper.cpp accepts per call.
+                            let initial_prompt = crate::whisper_engine::WhisperEngine::build_initial_prompt(
+                                vocabulary_terms_clone.as_deref(),
+                                previous_text.as_deref(),
+                            );
                             match transcribe_chunk_with_provider(
                                 &engine_clone,
                                 chunk,
                                 &app_clone,
                                 include_word_timestamps,
+                                initial_prompt.as_deref(),
                             )
                             .await
                             {
                                 Ok((transcript, confidence_opt, is_partial, word_timestamps)) => {
+                                    if !transcript.trim().is_empty() {
+                                        previous_text = Some(crate::whisper_engine::WhisperEngine::build_prompt_context(
+                                            &transcript,
+                                            crate::whisper_engine::WhisperEngine::PROMPT_CONTEXT_MAX_CHARS,
+                                        ));
+                                    }
                                     if let Some(words) = word_timestamps {
                                         crate::audio::recording_commands::accumulate_word_timestamps(chunk_timestamp, words);
                                     }
@@ -411,11 +438,17 @@ pub fn start_transcription_task<R: Runtime>(
 /// wired up yet (tracked separately), so this parameter exists but has no live caller
 /// passing `true` yet. Passing `false` keeps behavior/cost identical to before this
 /// parameter existed.
+///
+/// `initial_prompt`, when `Some`, is the combined vocabulary+continuity string already
+/// built by the caller (`WhisperEngine::build_initial_prompt`, ADR-0028/ADR-0029), used
+/// only by the Whisper branch as whisper.cpp decode context (`set_initial_prompt`). The
+/// Parakeet and trait-based branches ignore it -- Parakeet has no prompt-conditioning API.
 async fn transcribe_chunk_with_provider<R: Runtime>(
     engine: &TranscriptionEngine,
     chunk: AudioChunk,
     app: &AppHandle<R>,
     include_word_timestamps: bool,
+    initial_prompt: Option<&str>,
 ) -> std::result::Result<(String, Option<f32>, bool, Option<Vec<crate::diarization::WordTiming>>), TranscriptionError> {
     // Convert to 16kHz mono for transcription
     let transcription_data = if chunk.sample_rate != 16000 {
@@ -456,7 +489,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
             let language = crate::get_language_preference_internal();
 
             match whisper_engine
-                .transcribe_audio_with_confidence(speech_samples, language, include_word_timestamps)
+                .transcribe_audio_with_confidence(speech_samples, language, include_word_timestamps, initial_prompt)
                 .await
             {
                 Ok((text, confidence, is_partial, word_timestamps)) => {

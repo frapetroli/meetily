@@ -325,6 +325,11 @@ async fn run_retranscription<R: Runtime>(
         .await
         .map_err(|e| anyhow!(e))?;
     let diarization_enabled = diarization_paths.is_some();
+
+    // Active custom vocabulary (ADR-0029), resolved once for the whole job -- not
+    // re-queried per segment. `None` when no vocabulary is selected or Parakeet is used
+    // (no prompt-conditioning API there).
+    let vocabulary_terms = crate::database::repositories::vocabulary::VocabularyRepository::resolve_active_terms(&app).await;
     let diarization_task = diarization_paths.map(|(segmentation_model_path, embedding_model_path, max_speakers)| {
         let audio_for_diarization = diarization_samples.clone();
         tokio::task::spawn_blocking(move || -> Result<Vec<SpeakerSegment>> {
@@ -474,6 +479,10 @@ async fn run_retranscription<R: Runtime>(
     // (seconds) -- only populated when diarization_enabled, merged with the diarization
     // speaker segments after this loop (ADR-0013).
     let mut word_timestamps_accumulator: Vec<WordTiming> = Vec::new();
+    // Cross-chunk continuity for Whisper (see `WhisperEngine::build_prompt_context`): the
+    // previous segment's cleaned transcript, carried forward as this segment's decode
+    // prompt. Unread when `use_parakeet` (no prompt-conditioning API there).
+    let mut previous_text: Option<String> = None;
 
     for (i, segment) in processable_segments.iter().enumerate() {
         // Check for cancellation before each segment
@@ -522,8 +531,12 @@ async fn run_retranscription<R: Runtime>(
             (text, 0.9f32)
         } else {
             let engine = whisper_engine.as_ref().unwrap();
+            let initial_prompt = crate::whisper_engine::WhisperEngine::build_initial_prompt(
+                vocabulary_terms.as_deref(),
+                previous_text.as_deref(),
+            );
             let (text, conf, _, word_timestamps) = engine
-                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone(), diarization_enabled)
+                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone(), diarization_enabled, initial_prompt.as_deref())
                 .await
                 .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
             if let Some(words) = word_timestamps {
@@ -544,6 +557,10 @@ async fn run_retranscription<R: Runtime>(
                 i + 1, processable_count, segment_duration_sec, conf,
                 if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
             );
+            previous_text = Some(crate::whisper_engine::WhisperEngine::build_prompt_context(
+                trimmed,
+                crate::whisper_engine::WhisperEngine::PROMPT_CONTEXT_MAX_CHARS,
+            ));
             all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
             total_confidence += conf;
         } else {
