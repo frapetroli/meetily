@@ -110,6 +110,16 @@ impl DiarizationEngine {
         self.sample_rate
     }
 
+    /// Dimensionality of the embedding vectors this instance's extractor produces --
+    /// varies by embedding model (e.g. eres2net vs campplus vs wespeaker/titanet), never
+    /// assumed fixed elsewhere in this module or in `clustering.rs` (cosine similarity is
+    /// dimension-agnostic). Mainly a diagnostic for `examples/diarization_calibration.rs`
+    /// when comparing embedding models (docs/adr/0030) -- confirms at a glance that a
+    /// different `--embedding-model-override` really loaded a different model.
+    pub fn embedding_dim(&self) -> i32 {
+        self.extractor.dim()
+    }
+
     /// Process one ~20-30s chunk of mixed audio (mic+system, same pre-VAD tap as
     /// `RecordingSaver` -- ADR-0009/ADR-0015). `chunk_start_time` is the chunk's offset
     /// in seconds from the start of the recording, used to convert the chunk-relative

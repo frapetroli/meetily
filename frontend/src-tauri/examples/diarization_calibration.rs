@@ -61,6 +61,16 @@ struct Cli {
     /// `--nearest-neighbors 10,15,25`.
     #[arg(long)]
     nearest_neighbors: Option<String>,
+
+    /// Full path to a standalone embedding `.onnx` file to use INSTEAD of
+    /// `<models-dir>/embedding-model.onnx` -- for A/B-comparing an alternative embedding
+    /// model against the production one (docs/adr/0030, diarization roadmap direzione #2:
+    /// segmentation/embedding mismatch hypothesis). Segmentation is never overridden here,
+    /// only embedding -- boundary quality is not what this experiment is about. The
+    /// production model file itself is untouched either way (this never writes into
+    /// `--models-dir`), so there is no risk of clobbering the real app's model.
+    #[arg(long)]
+    embedding_model_override: Option<PathBuf>,
 }
 
 struct GroundTruthTurn {
@@ -310,16 +320,27 @@ fn main() -> Result<()> {
     };
 
     let segmentation_model_path = cli.models_dir.join("segmentation-model.onnx");
-    let embedding_model_path = cli.models_dir.join("embedding-model.onnx");
+    let default_embedding_model_path = cli.models_dir.join("embedding-model.onnx");
+    let embedding_model_path = cli
+        .embedding_model_override
+        .clone()
+        .unwrap_or(default_embedding_model_path);
     for p in [&segmentation_model_path, &embedding_model_path] {
         if !p.exists() {
             bail!(
                 "model file not found: {} -- download the diarization models once via the \
                  app (Settings > toggle diarization on > Download), then point --models-dir \
-                 at that folder",
+                 at that folder (and/or check --embedding-model-override, if given)",
                 p.display()
             );
         }
+    }
+    if cli.embedding_model_override.is_some() {
+        println!(
+            "Using OVERRIDDEN embedding model: {}\n(segmentation model unchanged: {})\n",
+            embedding_model_path.display(),
+            segmentation_model_path.display()
+        );
     }
 
     let recordings = discover_recordings(&data_dir)?;
@@ -352,6 +373,7 @@ fn main() -> Result<()> {
             1,
         )
         .map_err(|e| anyhow!("failed to init DiarizationEngine: {e}"))?;
+        println!("  embedding dim: {}", engine.embedding_dim());
         engine
             .process_chunk(&samples, 0.0)
             .map_err(|e| anyhow!("process_chunk failed: {e}"))?;
