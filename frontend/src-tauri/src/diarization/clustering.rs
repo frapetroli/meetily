@@ -585,6 +585,101 @@ pub fn cluster_embeddings_spectral_with_p(
     kmeans(&rows, k)
 }
 
+/// Duration (seconds) below which a "sandwiched" segment (see `smooth_isolated_segments`)
+/// is treated as a plausible clustering artifact rather than a genuine speaker turn.
+/// Starting default, not yet calibrated on real reference data -- same status
+/// `REATTACH_THRESHOLD` had before ADR-0022's calibration on real recordings (see
+/// docs/adr/0031-... in the docs workspace).
+pub const MAX_SANDWICH_DURATION_SECS: f64 = 3.0;
+
+/// Cosine-similarity floor a sandwiched segment's embedding must clear against the
+/// surrounding speaker's centroid to be reattached to it. Deliberately set to the same
+/// value as `DEFAULT_CLUSTERING_THRESHOLD`, not a more lenient guess: this project's own
+/// calibration history (ADR-0022) found that a too-lenient reattachment threshold wrongly
+/// merges genuinely different speakers, and the value that survived real-data calibration
+/// there happened to match this same constant.
+pub const SANDWICH_REATTACH_THRESHOLD: f32 = DEFAULT_CLUSTERING_THRESHOLD;
+
+/// Smooths isolated single-segment "sandwiches" in a **time-ordered** sequence of
+/// clustered segments: if segment `i`'s label differs from both its immediate temporal
+/// neighbors, but those two neighbors share the *same* label (A, B, A), segment `i` is
+/// reassigned to that surrounding label `A` when BOTH hold:
+/// - it's short (`<= MAX_SANDWICH_DURATION_SECS`) -- a genuine speaker turn tends to run
+///   longer than a clustering artifact;
+/// - its embedding isn't confidently distant from the surrounding speaker's centroid
+///   (cosine similarity `>= SANDWICH_REATTACH_THRESHOLD`) -- so a genuinely different,
+///   acoustically distinct third speaker sandwiched between two turns of another speaker
+///   (a real brief interjection) is left alone.
+///
+/// Named technique in the diarization literature: "minimum duration constraint" combined
+/// with post-clustering resegmentation (pyannote.audio's own "Resegmentation" step reports
+/// +5% cluster purity for -2% coverage on real corpora) -- see docs/adr/0031-... in the
+/// docs workspace for the full grounding and citations.
+///
+/// `embeddings`/`starts`/`ends`/`labels` must be the same length and already sorted by
+/// `starts` ascending -- this function does not sort them itself, since callers
+/// (`engine.rs`) already have to maintain that order for other reasons (building the
+/// final `SpeakerSegment` list).
+///
+/// Single left-to-right pass evaluated against the *original* labels/centroids -- does
+/// not iterate to a fixpoint, and only catches a single-segment sandwich (A, B, A), not a
+/// run of two or more consecutive differing segments (A, B, B, A). Same kind of accepted
+/// simplification the removed `reattach_small_clusters` made for its own single pass
+/// (ADR-0025) -- a future iteration could revisit this if real data shows it matters.
+pub fn smooth_isolated_segments(
+    embeddings: &[Vec<f32>],
+    starts: &[f64],
+    ends: &[f64],
+    labels: &[usize],
+) -> Vec<usize> {
+    let n = labels.len();
+    if n < 3 {
+        return labels.to_vec();
+    }
+
+    // Centroid per label, computed once from the *original* labels -- reattachments
+    // decided below never feed back into these centroids, so results don't depend on
+    // iteration order within this single pass.
+    let dim = embeddings[0].len();
+    let mut sums: std::collections::HashMap<usize, Vec<f32>> = std::collections::HashMap::new();
+    let mut counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (embedding, &label) in embeddings.iter().zip(labels) {
+        let entry = sums.entry(label).or_insert_with(|| vec![0.0f32; dim]);
+        for (s, &v) in entry.iter_mut().zip(embedding.iter()) {
+            *s += v;
+        }
+        *counts.entry(label).or_insert(0) += 1;
+    }
+    let centroids: std::collections::HashMap<usize, Vec<f32>> = sums
+        .into_iter()
+        .map(|(label, sum)| {
+            let count = counts[&label] as f32;
+            (label, sum.into_iter().map(|s| s / count).collect())
+        })
+        .collect();
+
+    let mut smoothed = labels.to_vec();
+    for i in 1..n - 1 {
+        let prev_label = labels[i - 1];
+        let cur_label = labels[i];
+        let next_label = labels[i + 1];
+        if prev_label != next_label || cur_label == prev_label {
+            continue;
+        }
+        let duration = ends[i] - starts[i];
+        if duration > MAX_SANDWICH_DURATION_SECS {
+            continue;
+        }
+        let Some(centroid) = centroids.get(&prev_label) else {
+            continue;
+        };
+        if cosine_similarity(&embeddings[i], centroid) >= SANDWICH_REATTACH_THRESHOLD {
+            smoothed[i] = prev_label;
+        }
+    }
+    smoothed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,5 +957,103 @@ mod tests {
 
         let high = cluster_embeddings_spectral_with_p(&embeddings, 5, Some(1000));
         assert_eq!(high.len(), embeddings.len());
+    }
+
+    // -- smooth_isolated_segments (post-clustering resegmentation, docs/adr/0031) --------
+
+    #[test]
+    fn smooth_isolated_segments_reattaches_short_similar_sandwich() {
+        // A, B, A where B is short (1s) and B's embedding is close to A's (cosine sim
+        // ~0.97, well above SANDWICH_REATTACH_THRESHOLD 0.6) -- a plausible clustering
+        // artifact, should be reattached to A (label 0).
+        let a = vec![1.0f32, 0.0];
+        let noisy_a = vec![0.8f32, 0.2]; // cos sim with `a` ~= 0.970
+        let embeddings = vec![a.clone(), noisy_a, a];
+        let starts = vec![0.0, 5.0, 6.0];
+        let ends = vec![4.0, 6.0, 10.0]; // middle segment duration = 1.0s
+        let labels = vec![0, 1, 0];
+
+        let smoothed = smooth_isolated_segments(&embeddings, &starts, &ends, &labels);
+        assert_eq!(smoothed, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn smooth_isolated_segments_leaves_dissimilar_sandwich_alone() {
+        // A, B, A where B is short but its embedding is orthogonal to A's (cosine sim
+        // 0.0, below threshold) -- plausibly a genuine brief interjection from a
+        // different speaker, must be left alone.
+        let a = vec![1.0f32, 0.0];
+        let b = vec![0.0f32, 1.0];
+        let embeddings = vec![a.clone(), b, a];
+        let starts = vec![0.0, 5.0, 6.0];
+        let ends = vec![4.0, 6.0, 10.0]; // middle segment duration = 1.0s, still short
+        let labels = vec![0, 1, 0];
+
+        let smoothed = smooth_isolated_segments(&embeddings, &starts, &ends, &labels);
+        assert_eq!(smoothed, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn smooth_isolated_segments_leaves_long_sandwich_alone() {
+        // Same near-identical embeddings as the "reattaches" case, but the middle
+        // segment is long (10s, above MAX_SANDWICH_DURATION_SECS) -- treated as a
+        // genuine turn regardless of embedding similarity.
+        let a = vec![1.0f32, 0.0];
+        let noisy_a = vec![0.8f32, 0.2];
+        let embeddings = vec![a.clone(), noisy_a, a];
+        let starts = vec![0.0, 5.0, 16.0];
+        let ends = vec![4.0, 15.0, 20.0]; // middle segment duration = 10.0s
+        let labels = vec![0, 1, 0];
+
+        let smoothed = smooth_isolated_segments(&embeddings, &starts, &ends, &labels);
+        assert_eq!(smoothed, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn smooth_isolated_segments_never_touches_first_or_last() {
+        // First segment's label differs from what would be its "next" neighbor pattern,
+        // but has no left neighbor to sandwich it -- must never be touched, regardless
+        // of how similar/short it is. Same for the last segment (no right neighbor).
+        let a = vec![1.0f32, 0.0];
+        let noisy_a = vec![0.8f32, 0.2];
+        let embeddings = vec![noisy_a.clone(), a.clone(), a.clone(), noisy_a];
+        let starts = vec![0.0, 1.0, 5.0, 6.0];
+        let ends = vec![0.5, 4.0, 5.5, 7.0];
+        let labels = vec![1, 0, 0, 1];
+
+        let smoothed = smooth_isolated_segments(&embeddings, &starts, &ends, &labels);
+        assert_eq!(smoothed, labels);
+    }
+
+    #[test]
+    fn smooth_isolated_segments_does_not_touch_a_run_of_two_differing_segments() {
+        // A, B, B, A -- a run of two, not a single-segment sandwich. Known limitation
+        // (see doc comment): left untouched by this single-pass version.
+        let a = vec![1.0f32, 0.0];
+        let noisy_a = vec![0.8f32, 0.2];
+        let embeddings = vec![a.clone(), noisy_a.clone(), noisy_a, a];
+        let starts = vec![0.0, 5.0, 6.5, 8.0];
+        let ends = vec![4.0, 6.0, 7.5, 12.0];
+        let labels = vec![0, 1, 1, 0];
+
+        let smoothed = smooth_isolated_segments(&embeddings, &starts, &ends, &labels);
+        assert_eq!(smoothed, labels);
+    }
+
+    #[test]
+    fn smooth_isolated_segments_returns_short_sequences_unchanged() {
+        assert_eq!(smooth_isolated_segments(&[], &[], &[], &[]), Vec::<usize>::new());
+
+        let one = vec![vec![1.0f32, 0.0]];
+        assert_eq!(
+            smooth_isolated_segments(&one, &[0.0], &[1.0], &[0]),
+            vec![0]
+        );
+
+        let two = vec![vec![1.0f32, 0.0], vec![0.0f32, 1.0]];
+        assert_eq!(
+            smooth_isolated_segments(&two, &[0.0, 1.0], &[1.0, 2.0], &[0, 1]),
+            vec![0, 1]
+        );
     }
 }

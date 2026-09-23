@@ -18,7 +18,9 @@
 //! Final speaker identity is resolved once, across every chunk of the call, by
 //! `clustering::cluster_embeddings_spectral_with_p` (see `finalize()`, ADR-0024).
 
-use crate::diarization::clustering::{cluster_embeddings_spectral_with_p, normalize_labels};
+use crate::diarization::clustering::{
+    cluster_embeddings_spectral_with_p, normalize_labels, smooth_isolated_segments,
+};
 use crate::diarization::merge::SpeakerSegment;
 use log::info;
 use sherpa_onnx::{
@@ -238,21 +240,35 @@ impl DiarizationEngine {
             return Vec::new();
         }
 
-        let embeddings: Vec<Vec<f32>> = self.accumulated.iter().map(|(e, _, _)| e.clone()).collect();
+        // Sort by start time up front: clustering itself doesn't care about order, but
+        // the post-clustering smoothing pass below (`smooth_isolated_segments`) needs
+        // real temporal adjacency, and building the final segment list from this same
+        // order means no separate sort is needed afterwards (unlike before this pass
+        // was added, where sorting only happened at the very end).
+        let mut ordered: Vec<&(Vec<f32>, f64, f64)> = self.accumulated.iter().collect();
+        ordered.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let embeddings: Vec<Vec<f32>> = ordered.iter().map(|(e, _, _)| e.clone()).collect();
+        let starts: Vec<f64> = ordered.iter().map(|(_, start, _)| *start).collect();
+        let ends: Vec<f64> = ordered.iter().map(|(_, _, end)| *end).collect();
+
         let labels = cluster_embeddings_spectral_with_p(&embeddings, max_speakers, p_override);
+        // Resegmentation pass (docs/adr/0031): reattaches isolated single-segment
+        // "sandwiches" (A, B, A) to the surrounding speaker when the sandwiched segment
+        // is short and not confidently a different voice -- see `smooth_isolated_segments`'s
+        // doc comment for the full rationale and the literature it's grounded in.
+        let labels = smooth_isolated_segments(&embeddings, &starts, &ends, &labels);
         let labels = normalize_labels(&labels);
 
-        let mut segments: Vec<SpeakerSegment> = self
-            .accumulated
+        starts
             .iter()
+            .zip(ends.iter())
             .zip(labels)
-            .map(|((_, start, end), label)| SpeakerSegment {
+            .map(|((start, end), label)| SpeakerSegment {
                 start: *start,
                 end: *end,
                 speaker: format!("speaker_{label}"),
             })
-            .collect();
-        segments.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
-        segments
+            .collect()
     }
 }
