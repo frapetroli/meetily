@@ -5,10 +5,13 @@
 //! job (validated empirically with a standalone prototype against the project's own
 //! spike audio/models -- see ADR-0017 and the accompanying conversation notes):
 //!
-//! 1. `sherpa_onnx::OfflineSpeakerDiarization::process()` is used **only** to obtain
-//!    segment boundaries (`start`/`end`) for the chunk -- its own internal `speaker`
-//!    label is discarded, because it is local to this one call and not comparable
-//!    across chunks (sherpa-onnx exposes no standalone segmentation-only API).
+//! 1. `sherpa_onnx::OfflineSpeakerDiarization::process()` is used to obtain segment
+//!    boundaries (`start`/`end`) for the chunk. Its own internal `speaker` label is
+//!    *not* discarded outright any more (ADR-0032) -- it's used to merge adjacent
+//!    segments sherpa-onnx already called the same speaker before re-embedding
+//!    (`merge_adjacent_same_speaker`), then dropped: it is local to this one call and
+//!    never compared across chunks (sherpa-onnx exposes no standalone segmentation-only
+//!    API).
 //! 2. Each returned segment is **re-embedded independently** via
 //!    `SpeakerEmbeddingExtractor`/`OnlineStream` (the only standalone embedding API --
 //!    `OfflineSpeakerDiarizationResult` does not expose the raw embedding vectors it
@@ -35,6 +38,53 @@ use thiserror::Error;
 /// against real audio: two ~0.7s segments in one test file had near-zero similarity to
 /// every other segment, including their own true speaker).
 pub const MIN_SEGMENT_DURATION_SECS: f32 = 1.0;
+
+/// Maximum time gap (seconds) between two adjacent segments -- already assigned to the
+/// same chunk-local speaker by sherpa-onnx's own segmentation+clustering -- for them to
+/// still be merged into one span before re-embedding (see `merge_adjacent_same_speaker`).
+/// Kept small deliberately: merging across a *large* gap would pull unrelated/silent
+/// audio into the merged span and degrade the resulting embedding instead of stabilizing
+/// it -- this closes micro-pauses/prosodic breaks within one continuous utterance, not
+/// real silence between turns.
+pub const MAX_MERGE_GAP_SECS: f32 = 0.5;
+
+/// Merges adjacent `(start, end, local_speaker)` spans that share the same
+/// `local_speaker` id and are close enough in time (`<= MAX_MERGE_GAP_SECS` apart) into
+/// a single wider span, dropping the (now no-longer-needed) local speaker id. Input must
+/// already be sorted by `start` (same order
+/// `OfflineSpeakerDiarizationResult::sort_by_start_time()` returns).
+///
+/// Exists because sherpa-onnx's segmentation step often splits one continuous utterance
+/// from a single speaker into several short adjacent segments (micro-pauses, prosodic
+/// variation -- not itself a bug). Re-embedding each of those short pieces
+/// *independently*, as this module did before this function existed, produces several
+/// noisier embeddings instead of one stable one -- any of which can drift close enough
+/// to a *different* speaker's cluster to get misassigned, producing sustained
+/// alternation between two labels for what is really one continuous speaker turn
+/// (reported directly against real app output, see docs/adr/0032-... in the docs
+/// workspace). Merging first, using the *local* speaker id sherpa-onnx's own
+/// segmentation+clustering already computed for this one chunk (valid only within this
+/// call, never compared across chunks -- see module docs), avoids that without
+/// weakening pyannote-segmentation's own validated ability to detect a genuine speaker
+/// change with zero pause (ADR-0007's spike): two adjacent segments are only merged
+/// when sherpa-onnx itself already called them the same speaker, never merely because
+/// they're close together in time.
+///
+/// Pure function, no FFI -- takes plain tuples rather than
+/// `OfflineSpeakerDiarizationSegment` directly so it's testable without the sherpa-onnx
+/// crate.
+pub fn merge_adjacent_same_speaker(segments: &[(f32, f32, i32)]) -> Vec<(f32, f32)> {
+    let mut merged: Vec<(f32, f32, i32)> = Vec::new();
+    for &(start, end, speaker) in segments {
+        match merged.last_mut() {
+            Some(last) if last.2 == speaker && start - last.1 <= MAX_MERGE_GAP_SECS => {
+                last.1 = end;
+            }
+            _ => merged.push((start, end, speaker)),
+        }
+    }
+    merged.into_iter().map(|(s, e, _)| (s, e)).collect()
+}
 
 #[derive(Debug, Error)]
 pub enum DiarizationEngineError {
@@ -80,10 +130,11 @@ impl DiarizationEngine {
                 num_threads,
                 ..Default::default()
             },
-            // Only used to shape the boundaries we get back -- the resulting `speaker`
-            // label on each segment is discarded (see module docs). num_clusters=-1
-            // (auto) is fine here: validated empirically that boundary quality doesn't
-            // depend on knowing the true speaker count in advance.
+            // Used to shape the boundaries we get back and, since ADR-0032, to merge
+            // adjacent same-(chunk-)speaker segments before re-embedding -- see
+            // `merge_adjacent_same_speaker`'s doc comment and the module docs.
+            // num_clusters=-1 (auto) is fine here: validated empirically that boundary
+            // quality doesn't depend on knowing the true speaker count in advance.
             ..Default::default()
         };
         let diarizer = OfflineSpeakerDiarization::create(&diar_config)
@@ -149,15 +200,23 @@ impl DiarizationEngine {
 
         let segments = result.sort_by_start_time();
         let raw_segment_count = segments.len();
+
+        // Merge adjacent segments sherpa-onnx's own chunk-local segmentation+clustering
+        // already assigned to the same speaker, before re-embedding (ADR-0032) -- see
+        // `merge_adjacent_same_speaker`'s doc comment for the full rationale.
+        let merge_input: Vec<(f32, f32, i32)> =
+            segments.iter().map(|s| (s.start, s.end, s.speaker)).collect();
+        let merged_segments = merge_adjacent_same_speaker(&merge_input);
+        let merged_segment_count = merged_segments.len();
         let mut embedded_count = 0usize;
 
         let embedding_started = std::time::Instant::now();
-        for seg in segments {
-            if seg.end - seg.start < MIN_SEGMENT_DURATION_SECS {
+        for (seg_start, seg_end) in merged_segments {
+            if seg_end - seg_start < MIN_SEGMENT_DURATION_SECS {
                 continue;
             }
-            let start_idx = (seg.start * self.sample_rate as f32) as usize;
-            let end_idx = ((seg.end * self.sample_rate as f32) as usize).min(samples.len());
+            let start_idx = (seg_start * self.sample_rate as f32) as usize;
+            let end_idx = ((seg_end * self.sample_rate as f32) as usize).min(samples.len());
             if end_idx <= start_idx {
                 continue;
             }
@@ -177,19 +236,20 @@ impl DiarizationEngine {
 
             self.accumulated.push((
                 embedding,
-                chunk_start_time + seg.start as f64,
-                chunk_start_time + seg.end as f64,
+                chunk_start_time + seg_start as f64,
+                chunk_start_time + seg_end as f64,
             ));
             embedded_count += 1;
         }
         let embedding_elapsed = embedding_started.elapsed();
 
         info!(
-            "DiarizationEngine::process_chunk(start={:.1}s, {} samples): sherpa-onnx process()={:?} ({} raw segments), embedding loop={:?} ({} embedded)",
+            "DiarizationEngine::process_chunk(start={:.1}s, {} samples): sherpa-onnx process()={:?} ({} raw segments, {} after same-speaker merge), embedding loop={:?} ({} embedded)",
             chunk_start_time,
             samples.len(),
             diarizer_elapsed,
             raw_segment_count,
+            merged_segment_count,
             embedding_elapsed,
             embedded_count
         );
@@ -270,5 +330,65 @@ impl DiarizationEngine {
                 speaker: format!("speaker_{label}"),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- merge_adjacent_same_speaker (ADR-0032) --------------------------------------
+
+    #[test]
+    fn merge_adjacent_same_speaker_merges_close_same_speaker_segments() {
+        // Same local speaker (0), gap of 0.2s (<= MAX_MERGE_GAP_SECS) -- merged into
+        // one span from the first start to the second end.
+        let segments = vec![(0.0f32, 4.0, 0), (4.2, 6.0, 0)];
+        let merged = merge_adjacent_same_speaker(&segments);
+        assert_eq!(merged, vec![(0.0, 6.0)]);
+    }
+
+    #[test]
+    fn merge_adjacent_same_speaker_does_not_merge_different_speakers() {
+        // Different local speakers, small gap -- sherpa-onnx itself already called
+        // these different people, so they must stay separate regardless of the gap.
+        let segments = vec![(0.0f32, 4.0, 0), (4.2, 6.0, 1)];
+        let merged = merge_adjacent_same_speaker(&segments);
+        assert_eq!(merged, vec![(0.0, 4.0), (4.2, 6.0)]);
+    }
+
+    #[test]
+    fn merge_adjacent_same_speaker_does_not_merge_across_a_large_gap() {
+        // Same local speaker, but the gap (5.0s) exceeds MAX_MERGE_GAP_SECS (0.5s) --
+        // merging would pull unrelated/silent audio into the span, so these stay
+        // separate even though sherpa-onnx called them the same speaker.
+        let segments = vec![(0.0f32, 4.0, 0), (9.0, 11.0, 0)];
+        let merged = merge_adjacent_same_speaker(&segments);
+        assert_eq!(merged, vec![(0.0, 4.0), (9.0, 11.0)]);
+    }
+
+    #[test]
+    fn merge_adjacent_same_speaker_merges_a_chain_of_three() {
+        let segments = vec![(0.0f32, 2.0, 0), (2.1, 4.0, 0), (4.3, 6.0, 0)];
+        let merged = merge_adjacent_same_speaker(&segments);
+        assert_eq!(merged, vec![(0.0, 6.0)]);
+    }
+
+    #[test]
+    fn merge_adjacent_same_speaker_keeps_a_sandwiched_different_speaker_separate() {
+        // A, B, A all close together in time -- the middle B must not get bridged over,
+        // and the two A segments (not adjacent to each other) must not merge either.
+        let segments = vec![(0.0f32, 2.0, 0), (2.1, 3.0, 1), (3.1, 5.0, 0)];
+        let merged = merge_adjacent_same_speaker(&segments);
+        assert_eq!(merged, vec![(0.0, 2.0), (2.1, 3.0), (3.1, 5.0)]);
+    }
+
+    #[test]
+    fn merge_adjacent_same_speaker_handles_single_segment_and_empty_input() {
+        assert_eq!(merge_adjacent_same_speaker(&[]), Vec::<(f32, f32)>::new());
+        assert_eq!(
+            merge_adjacent_same_speaker(&[(1.0, 2.0, 0)]),
+            vec![(1.0, 2.0)]
+        );
     }
 }
